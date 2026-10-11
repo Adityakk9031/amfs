@@ -2,22 +2,18 @@
 
 from __future__ import annotations
 
-import sys
 from pathlib import Path
-from unittest.mock import MagicMock
 from uuid import uuid4
 
-if sys.platform == "win32" and "fcntl" not in sys.modules:
-    sys.modules["fcntl"] = MagicMock()
-
-import pytest
 from amfs_core.models import Commit
 from amfs_filesystem.adapter import FilesystemAdapter
 
 
 def test_save_and_get_commit_atomic(tmp_path: Path) -> None:
     adapter = FilesystemAdapter(root=tmp_path)
-    commit = Commit(id=str(uuid4()), branch="main", message="test commit", author_agent_id="test-agent")
+    commit = Commit(
+        id=str(uuid4()), branch="main", message="test commit", author_agent_id="test-agent"
+    )
     adapter.save_commit(commit)
 
     loaded = adapter.get_commit(commit.id)
