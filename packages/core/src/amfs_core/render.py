@@ -157,10 +157,14 @@ def _one_line(value: Any) -> str:
     return " ".join(_stringify(value).split())
 
 
-def _procedure_parts(value: Any) -> tuple[str, list[str], list[tuple[str, str]]]:
+def procedure_parts(value: Any) -> tuple[str, list[str], list[tuple[str, str]]]:
     """``(goal, steps, extras)`` of a procedure value in either shape the OSS
     core accepts: a dict with ``goal``/``steps``/``preconditions``/``verify``/
-    ``on_failure``, or a string whose lines are the steps."""
+    ``on_failure``, or a string whose lines are the steps.
+
+    Public because a downstream renderer that must produce byte-identical
+    prompts (a trained model's serve path) splits a procedure the same way
+    this one does; see :mod:`amfs_core.substrate`."""
     if isinstance(value, dict):
         goal = _one_line(value.get("goal") or "") if value.get("goal") else ""
         raw_steps = value.get("steps")
@@ -184,6 +188,10 @@ def _procedure_parts(value: Any) -> tuple[str, list[str], list[tuple[str, str]]]
             return "", [_strip_marker(ln) for ln in lines], []
         return "", [value.strip()], []
     return "", [_one_line(value)], []
+
+
+#: Pre-contract name; callers written against it keep working.
+_procedure_parts = procedure_parts
 
 
 def _strip_marker(line: str) -> str:
@@ -358,6 +366,7 @@ __all__ = [
     "TriedAction",
     "confidence_bucket",
     "guidance_id",
+    "procedure_parts",
     "render_context",
     "render_procedures",
     "render_tried",
