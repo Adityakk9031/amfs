@@ -60,6 +60,9 @@ SYMBOLS: dict[str, tuple[str, ...]] = {
         "PROCEDURE_ENVIRONMENT_PRECONDITIONS",
         "procedure_issues",
         "procedure_action_keys",
+        # The workflow fields of a procedure, read the one way.
+        "procedure_roles",
+        "procedure_call_order",
     ),
     "amfs_core.evidence": (
         # What an outcome means.
@@ -90,6 +93,7 @@ SYMBOLS: dict[str, tuple[str, ...]] = {
         "guidance_id",
         "confidence_bucket",
         "procedure_parts",
+        "workflow_parts",
     ),
     "amfs_core.capture": (
         "scan_captured_text",
@@ -155,6 +159,9 @@ PROCEDURE_FIELDS: tuple[str, ...] = (
     "effects",
     "depends_on",
     "evidence",
+    "roles",
+    "call_order",
+    "output_contracts",
 )
 
 #: ``"module:name" -> "module:replacement" | None`` for every symbol or field

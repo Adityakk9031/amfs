@@ -54,7 +54,13 @@ PROCEDURE_TYPE = "procedure"
 #: Version of the rendering below. The managed-models renderer keeps its own
 #: ``RENDERER_VERSION`` and re-exports these functions; this one lets a
 #: ``guidance_id`` name the shape of the text it hashes.
-RENDER_VERSION = "v5"   # v5: structured lessons render as their claim
+#:
+#: v6: a workflow's fields render inside the procedure block — ``roles``
+#: (``name: what it does``, ``;``-joined), ``call_order`` (``→``-joined) and
+#: ``output_contracts`` (``name → contract``) — after ``preconditions`` /
+#: ``verify`` / ``on_failure``, each on its own indented line. A procedure
+#: without them renders exactly as in v5.
+RENDER_VERSION = "v6"
 
 
 def confidence_bucket(confidence: float) -> str:
@@ -160,7 +166,8 @@ def _one_line(value: Any) -> str:
 def procedure_parts(value: Any) -> tuple[str, list[str], list[tuple[str, str]]]:
     """``(goal, steps, extras)`` of a procedure value in either shape the OSS
     core accepts: a dict with ``goal``/``steps``/``preconditions``/``verify``/
-    ``on_failure``, or a string whose lines are the steps.
+    ``on_failure`` and, for a workflow, ``roles``/``call_order``/
+    ``output_contracts``; or a string whose lines are the steps.
 
     Public because a downstream renderer that must produce byte-identical
     prompts (a trained model's serve path) splits a procedure the same way
@@ -179,6 +186,7 @@ def procedure_parts(value: Any) -> tuple[str, list[str], list[tuple[str, str]]]:
         for label in ("preconditions", "verify", "on_failure"):
             if value.get(label):
                 extras.append((label, _one_line(value[label])))
+        extras.extend(workflow_parts(value))
         if not goal and not steps and not extras:
             steps = [_one_line(value)]
         return goal, steps, extras
@@ -188,6 +196,45 @@ def procedure_parts(value: Any) -> tuple[str, list[str], list[tuple[str, str]]]:
             return "", [_strip_marker(ln) for ln in lines], []
         return "", [value.strip()], []
     return "", [_one_line(value)], []
+
+
+def workflow_parts(value: Any) -> list[tuple[str, str]]:
+    """The workflow lines of a procedure value — ``roles``, ``call_order``,
+    ``output_contracts`` — as ``(label, text)`` pairs in that order, each
+    present only when the value carries it in a readable shape. Roles render
+    ``name: what it does`` joined by ``; `` (a role listed without a
+    description renders as its name); the call order joins its names with
+    `` → ``; contracts render ``name → contract``. A malformed field renders
+    stringified rather than vanishing, as a malformed procedure does."""
+    if not isinstance(value, dict):
+        return []
+    out: list[tuple[str, str]] = []
+    roles = value.get("roles")
+    if roles:
+        if isinstance(roles, dict):
+            text = "; ".join(
+                f"{_one_line(k)}: {_one_line(v)}" if v else _one_line(k) for k, v in roles.items()
+            )
+        elif isinstance(roles, list):
+            text = "; ".join(_one_line(r) for r in roles)
+        else:
+            text = _one_line(roles)
+        out.append(("roles", text))
+    order = value.get("call_order")
+    if order:
+        if isinstance(order, list):
+            text = " → ".join(_one_line(o) for o in order)
+        else:
+            text = _one_line(order)
+        out.append(("call_order", text))
+    contracts = value.get("output_contracts")
+    if contracts:
+        if isinstance(contracts, dict):
+            text = "; ".join(f"{_one_line(k)} → {_one_line(v)}" for k, v in contracts.items())
+        else:
+            text = _one_line(contracts)
+        out.append(("output_contracts", text))
+    return out
 
 
 #: Pre-contract name; callers written against it keep working.
