@@ -21,6 +21,7 @@ makes, so these run without network access or credentials.
 from __future__ import annotations
 
 import io
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import pytest
@@ -163,3 +164,22 @@ def test_history_and_read_at_version_stay_inside_the_entity(adapter: S3Adapter) 
     nested = adapter.read_at_version("myapp/auth", "token-ttl", 2)
     assert nested is not None
     assert nested.value == 7200
+
+
+def test_an_expired_entry_reads_as_missing(adapter: S3Adapter) -> None:
+    engine = CoWEngine(adapter, CausalTagger("agent-a"))
+    past = datetime.now(timezone.utc) - timedelta(hours=1)
+    engine.write("svc/checkout", "retry", {"max": 3}, ttl_at=past)
+
+    assert adapter.read("svc/checkout", "retry") is None
+    assert engine.read("svc/checkout", "retry") is None
+
+
+def test_an_entry_whose_ttl_has_not_elapsed_still_reads(adapter: S3Adapter) -> None:
+    engine = CoWEngine(adapter, CausalTagger("agent-a"))
+    future = datetime.now(timezone.utc) + timedelta(hours=1)
+    engine.write("svc/checkout", "retry", {"max": 3}, ttl_at=future)
+
+    entry = adapter.read("svc/checkout", "retry")
+    assert entry is not None
+    assert entry.value == {"max": 3}
