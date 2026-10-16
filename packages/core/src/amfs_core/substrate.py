@@ -51,6 +51,9 @@ SYMBOLS: dict[str, tuple[str, ...]] = {
         "OutcomeRecord",
         "AttemptRecord",
         "RecallConfig",
+        # What an outcome does to confidence, by outcome type. A calibrator
+        # that learns per-domain multipliers falls back to these.
+        "OUTCOME_MULTIPLIERS",
         # Procedures: what a value of ``memory_type == "procedure"`` carries.
         "PROCEDURE_REQUIRED_FIELDS",
         "PROCEDURE_OPTIONAL_FIELDS",
