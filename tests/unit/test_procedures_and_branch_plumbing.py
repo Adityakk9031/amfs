@@ -141,8 +141,19 @@ class TestProcedureType:
             "planner": "drafts the plan", "executor": "runs it one tool per step",
         }
         assert procedure_roles({**PROCEDURE, "roles": ["a", " b "]}) == {"a": "", "b": ""}
+        described = {"a": None, " b ": "runs"}
+        assert procedure_roles({**PROCEDURE, "roles": described}) == {"a": "", "b": "runs"}
         assert procedure_roles({**PROCEDURE, "roles": "planner"}) == {}
         assert procedure_roles(PROCEDURE) == {}
+        # A ``roles`` the linter flags reads as empty — the dict form too: a
+        # non-string description, a blank or non-string name, or a mix of good
+        # and bad keys is not a well-shaped workflow, not a partial name map.
+        malformed = (
+            {"a": 1}, {"a": "ok", "": "blank"}, {"a": "ok", 2: "num"}, {"a": ["x"]}, {}, [],
+        )
+        for bad in malformed:
+            assert "malformed_roles" in procedure_issues({**PROCEDURE, "roles": bad}), bad
+            assert procedure_roles({**PROCEDURE, "roles": bad}) == {}, bad
         assert procedure_call_order(WORKFLOW) == ["planner", "executor"]
         assert procedure_call_order({**PROCEDURE, "call_order": [" a ", "b"]}) == ["a", "b"]
         assert procedure_call_order({**PROCEDURE, "call_order": []}) == []

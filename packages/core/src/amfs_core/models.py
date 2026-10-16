@@ -216,23 +216,31 @@ def _names(items: Any) -> bool:
     )
 
 
+def _well_formed_roles(roles: Any) -> bool:
+    """Whether ``roles`` is a well-shaped role list — a non-empty list of
+    non-blank names, or a non-empty dict of non-blank names to a description
+    (a string) or ``None``. The one test the linter
+    (:func:`procedure_issues`, ``malformed_roles``) and the reader
+    (:func:`procedure_roles`) share, so a ``roles`` the linter flags never
+    reads as a name map."""
+    if isinstance(roles, dict):
+        return bool(roles) and all(
+            isinstance(k, str) and k.strip() and (v is None or isinstance(v, str))
+            for k, v in roles.items()
+        )
+    return _names(roles)
+
+
 def _workflow_issues(value: dict[str, Any]) -> list[str]:
     """Shape of the workflow fields when present; see :func:`procedure_issues`."""
     out: list[str] = []
     role_names: set[str] | None = None
     roles = value.get("roles")
     if roles is not None:
-        if isinstance(roles, dict):
-            ok = bool(roles) and all(
-                isinstance(k, str) and k.strip()
-                and (v is None or isinstance(v, str))
-                for k, v in roles.items()
-            )
-            role_names = {k.strip() for k in roles} if ok else None
+        ok = _well_formed_roles(roles)
+        if ok:
+            role_names = {r.strip() for r in roles}
         else:
-            ok = _names(roles)
-            role_names = {r.strip() for r in roles} if ok else None
-        if not ok:
             out.append("malformed_roles")
     order = value.get("call_order")
     if order is not None:
@@ -259,14 +267,11 @@ def procedure_roles(value: Any) -> dict[str, str]:
     if not isinstance(value, dict):
         return {}
     roles = value.get("roles")
+    if not _well_formed_roles(roles):
+        return {}
     if isinstance(roles, dict):
-        return {
-            str(k).strip(): (v if isinstance(v, str) else "")
-            for k, v in roles.items() if isinstance(k, str) and k.strip()
-        }
-    if _names(roles):
-        return {r.strip(): "" for r in roles}
-    return {}
+        return {k.strip(): (v or "") for k, v in roles.items()}
+    return {r.strip(): "" for r in roles}
 
 
 def procedure_call_order(value: Any) -> list[str]:
