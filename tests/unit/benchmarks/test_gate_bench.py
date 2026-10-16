@@ -189,6 +189,12 @@ def test_reward_reading_verdicts():
 
 def test_reward_scorecard_counts_and_verdict():
     assert scorecard.reward_scorecard(None)["verdict"] == "not_provided"
+    # ``[]`` is what the protocol's ``reward`` returns for a loop without a
+    # downstream reading (SenseLab on 403/404) — nothing, not ``insufficient``,
+    # so it cannot pull the whole card down.
+    empty = scorecard.reward_scorecard([])
+    assert empty["verdict"] == "not_provided" and empty["fixes"] == []
+    assert scorecard.overall_verdict("ok", empty["verdict"]) == "ok"
     card = scorecard.reward_scorecard([_reading(), _reading(down=((60, 45), (58, 31)))])
     assert card["verdict"] == "alert" and card["counts"]["diverged"] == 1 and card["read"] == 2
     ok = scorecard.reward_scorecard([_reading()])

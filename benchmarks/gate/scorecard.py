@@ -382,10 +382,18 @@ def reward_reading(r: RewardReading) -> dict[str, Any]:
 def reward_scorecard(readings: Sequence[RewardReading] | None) -> dict[str, Any]:
     """Every shipped change read; ``alert`` when any diverged, ``insufficient``
     when none was readable, ``ok`` otherwise; ``not_provided`` for a loop that
-    offers no downstream."""
+    offers no downstream — ``None`` (the reading was skipped) or ``[]`` (what
+    :class:`~benchmarks.gate.protocol.GatedLoop.reward` returns for a loop
+    without one, or with nothing shipped yet). Neither is evidence, so neither
+    counts against the card; ``insufficient`` is for shipped changes none of
+    which could be read."""
     if readings is None:
         return {"verdict": VERDICT_NOT_PROVIDED,
                 "note": "the loop provides no downstream reading of its shipped changes",
+                "counts": {}, "fixes": []}
+    if len(readings) == 0:
+        return {"verdict": VERDICT_NOT_PROVIDED,
+                "note": "the loop offered no shipped change to read downstream",
                 "counts": {}, "fixes": []}
     fixes = [reward_reading(r) for r in readings]
     counts = {v: 0 for v in (REWARD_NO_PROXY_GAIN, REWARD_INSUFFICIENT, REWARD_DIVERGED,
