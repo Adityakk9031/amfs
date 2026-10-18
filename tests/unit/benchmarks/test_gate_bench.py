@@ -492,6 +492,37 @@ def test_senselab_loop_over_a_fake_transport():
     assert loop.reward() == []  # 403: not in the plan → nothing, not an error
 
 
+def test_senselab_reads_ride_out_a_recycling_instance_but_writes_do_not(monkeypatch):
+    """A poll that meets a 503 — the service recycling an instance under a
+    run with hours of probes behind it — is retried with a growing wait; a
+    write is not, since the server may have taken it. A 503 that outlasts
+    the retries is the error it always was."""
+    statuses = iter([503, 502, 200])
+    waits: list[float] = []
+
+    def transport(method, path, body):
+        if method == "GET":
+            return next(statuses), _row("rejected", rejected_by="t1")
+        return 503, {"detail": "Service Unavailable"}
+
+    loop = senselab.SenseLabLoop("deploy-agent", transport)
+    monkeypatch.setattr(loop, "_sleep", waits.append)
+    assert loop.poll("gp-1").status is Status.REJECTED
+    assert waits == [2.0, 4.0]
+
+    with pytest.raises(senselab.SenseLabApiError, match="503"):
+        loop.inject(Probe(kind=ProbeKind.POISON, title="", summary="", entity_path="", key="",
+                          value="", why_wrong=""))
+    assert waits == [2.0, 4.0], "the write was not retried"
+
+    always_down = senselab.SenseLabLoop("deploy-agent", lambda m, p, b: (503, {"detail": "down"}))
+    monkeypatch.setattr(always_down, "_sleep", waits.append)
+    with pytest.raises(senselab.SenseLabApiError, match="503"):
+        always_down.poll("gp-1")
+    assert len(waits) == 2 + senselab.READ_RETRIES - 1
+    assert max(waits) == senselab.READ_RETRY_CAP_S
+
+
 # -- CLI -----------------------------------------------------------------------------
 
 def test_cli_run_and_score(tmp_path, capsys):
