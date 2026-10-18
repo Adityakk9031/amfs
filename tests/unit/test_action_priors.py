@@ -1264,6 +1264,77 @@ def test_regime_shifted_reads_the_label_not_a_failure_ratio() -> None:
                                 evidence_status="discredited", last_outcome_at=None)) is False
 
 
+def test_regime_shifted_with_recent_outcomes_needs_two_sessions_failing() -> None:
+    """The label forgives one failure only on a clean record: a rule with one
+    old failure reads ``contested`` on the next, so a single mislabelled run
+    flipped a ten-times-validated rule to "shifted" (dev, 2026-10-18: the
+    monitor's pattern missed one phrasing of "end of the billing period" and
+    a fix was drafted for a proration policy that had not changed). A caller
+    that has the rule's recent outcomes passes them, and the shift then needs
+    ``REGIME_MIN_FAILURES`` failures among the newest ``REGIME_RECENT_OUTCOMES``
+    from distinct sessions — verified ones, where anything in the window was
+    verified. Without them the aggregate rule stands as before."""
+    from types import SimpleNamespace
+
+    from amfs_core.evidence import (
+        REGIME_MIN_FAILURES,
+        REGIME_RECENT_OUTCOMES,
+        recent_failures_confirm_shift,
+        regime_shifted,
+    )
+
+    assert (REGIME_MIN_FAILURES, REGIME_RECENT_OUTCOMES) == (2, 5)
+    # Ten successes, one old failure, and the mislabelled one: contested.
+    rule = SimpleNamespace(success_count=10, failure_count=2, last_outcome="failure",
+                           evidence_status="contested", last_outcome_at=datetime.now(UTC))
+    assert regime_shifted(rule) is True  # the aggregate rule alone, as before
+
+    def o(outcome, session, verified_by=None):
+        return {"outcome_type": outcome, "session_id": session, "verified_by": verified_by}
+
+    one_bad_run = [o("failure", "s9", "driver-monitor"), o("success", "s8", "driver-monitor"),
+                   o("success", "s7"), o("success", "s6", "driver-monitor"), o("success", "s5")]
+    assert recent_failures_confirm_shift(one_bad_run) is False
+    assert regime_shifted(rule, recent=one_bad_run) is False
+    # Two sessions failing where it used to hold: a claim about the rule.
+    two_runs = [o("failure", "s9", "driver-monitor"), o("failure", "s8", "driver-monitor"),
+                o("success", "s7"), o("success", "s6"), o("success", "s5")]
+    assert recent_failures_confirm_shift(two_runs) is True
+    assert regime_shifted(rule, recent=two_runs) is True
+    # The same session failing twice (an attempt and its retry) is one session.
+    one_session = [o("failure", "s9"), o("minor_failure", "s9"), o("success", "s7"),
+                   o("success", "s6"), o("success", "s5")]
+    assert recent_failures_confirm_shift(one_session) is False
+    # Self-reported failures do not carry a shift past a monitor that is
+    # watching and did not fail the rule…
+    self_reports = [o("failure", "s9"), o("failure", "s8"), o("success", "s7", "driver-monitor"),
+                    o("success", "s6"), o("success", "s5")]
+    assert recent_failures_confirm_shift(self_reports) is False
+    # …but where nothing is verified, the reports are what there is.
+    unwatched = [o("failure", "s9"), o("failure", "s8"), o("success", "s7"), o("success", "s6")]
+    assert recent_failures_confirm_shift(unwatched) is True
+    # Only the newest REGIME_RECENT_OUTCOMES count: failures older than the
+    # window are the history the label already carries.
+    buried = [o("failure", "s9"), o("success", "s8"), o("success", "s7"), o("success", "s6"),
+              o("success", "s5"), o("failure", "s4"), o("failure", "s3")]
+    assert recent_failures_confirm_shift(buried) is False
+    assert recent_failures_confirm_shift(buried, window=7) is True
+    # Objects work as mappings do; unknown outcome types are not evidence.
+    objs = [SimpleNamespace(outcome_type="failure", session_id="a", verified_by=None),
+            SimpleNamespace(outcome_type="weird", session_id="b", verified_by=None),
+            SimpleNamespace(outcome_type="p2_incident", trace_id="c", verified_by=None)]
+    assert recent_failures_confirm_shift(objs) is True
+    assert recent_failures_confirm_shift([]) is False
+    # An empty recent list is a caller saying "I looked and found nothing":
+    # no shift.
+    assert regime_shifted(rule, recent=[]) is False
+    # The aggregate gate still comes first: a never-validated rule with two
+    # recent failures is not a regime to shift from.
+    young = SimpleNamespace(success_count=1, failure_count=2, last_outcome="failure",
+                            evidence_status="contested", last_outcome_at=datetime.now(UTC))
+    assert regime_shifted(young, recent=two_runs) is False
+
+
 def test_retrieve_priors_need_an_entity_path(client, server_mem) -> None:
     _stub_stats(server_mem._adapter, [_row([("resolve:a", False)])])
     resp = client.post("/api/v1/retrieve", json={"query": "card declined", "include_priors": True})

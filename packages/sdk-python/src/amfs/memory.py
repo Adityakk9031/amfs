@@ -1559,9 +1559,16 @@ class AgentMemory:
         keys alone do not (an episode that read nothing still happened
         somewhere); with the causal keys' paths it becomes the record's
         ``entity_paths``, which is how later retrieves on that entity find it.
-        *situation* is an optional label for the kind of task. *actions_taken*
-        is derived from the recorded actions, the attempts and the final action
-        index unless given explicitly — see ``amfs_core.actions.actions_taken``.
+        *situation* is an optional label for the kind of task. It goes on the
+        outcome record, where action priors and lessons read it, and on the
+        sealed trace as the ``situation`` attribute — the same stamp
+        ``Run.begin(situation=...)`` makes — because that is where the repair
+        loop's weak-situation scan reads it. Until it travelled on the trace
+        an agent that labelled every commit through ``amfs_commit_outcome``
+        or this method directly had no situations on the server at all, and
+        the scheduled proposer had nothing to read. *actions_taken* is derived
+        from the recorded actions, the attempts and the final action index
+        unless given explicitly — see ``amfs_core.actions.actions_taken``.
 
         *verified_by* says where the outcome came from when the agent did not
         decide it itself — ``"ci"``, ``"human"``, ``"verifier"``, ``"customer"``.
@@ -1618,10 +1625,16 @@ class AgentMemory:
         untrue one of the two. The trace is still built and still left on
         ``_last_trace``; only the write is skipped.
         """
-        # Validated first so a bad bag fails before anything is written.
-        commit_attributes = validate_session_attributes(
-            {**(attributes or {}), **provenance_attributes(verified_by, evidence)}
-        )
+        # Validated first so a bad bag fails before anything is written. The
+        # situation named on this commit is this run's label: it goes over a
+        # ``Run.begin`` stamp (the later, more specific statement) and over the
+        # same key in *attributes*, which is the same thing said twice.
+        commit_attributes = validate_session_attributes({
+            **(attributes or {}),
+            **({SITUATION_ATTRIBUTE: " ".join(str(situation).split())[:200]}
+               if situation and str(situation).strip() else {}),
+            **provenance_attributes(verified_by, evidence),
+        })
         explicit_calls = [
             c for c in (_normalize_llm_call(lc) for lc in (llm_calls or [])) if c is not None
         ]
