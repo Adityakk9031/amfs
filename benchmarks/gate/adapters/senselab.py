@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -51,6 +52,12 @@ from ..protocol import (
 
 EVAL_BASE = "/api/v1/eval"
 Transport = Callable[[str, str, dict[str, Any] | None], tuple[int, Any]]
+
+#: A read that meets one of these is retried; see :meth:`SenseLabLoop._ok`.
+TRANSIENT_STATUSES = frozenset({502, 503, 504})
+READ_RETRIES = 6
+READ_RETRY_BASE_S = 2.0
+READ_RETRY_CAP_S = 30.0
 
 
 class SenseLabApiError(RuntimeError):
@@ -133,10 +140,23 @@ class SenseLabLoop:
         return path + ("?" + urllib.parse.urlencode(q) if q else "")
 
     def _ok(self, method: str, path: str, body: dict[str, Any] | None = None) -> Any:
-        status, payload = self._call(method, path, body)
-        if status >= 400:
-            raise SenseLabApiError(status, payload, path)
-        return payload
+        """One call, or for a read, up to :data:`READ_RETRIES` of them: a
+        poll that meets a 502/503/504 — an instance recycling under the
+        service, a cold start — is retried after a short, growing wait
+        rather than ending a run that has hours of probes behind it. A write
+        is never retried here: the server may have taken it."""
+        attempts = READ_RETRIES if method == "GET" else 1
+        for attempt in range(1, attempts + 1):
+            status, payload = self._call(method, path, body)
+            if status in TRANSIENT_STATUSES and attempt < attempts:
+                self._sleep(min(READ_RETRY_CAP_S, READ_RETRY_BASE_S * 2 ** (attempt - 1)))
+                continue
+            if status >= 400:
+                raise SenseLabApiError(status, payload, path)
+            return payload
+        raise AssertionError("unreachable")  # pragma: no cover
+
+    _sleep = staticmethod(time.sleep)
 
     # -- the protocol -----------------------------------------------------------
 
