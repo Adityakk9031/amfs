@@ -125,4 +125,13 @@ harness is the public statement of that arithmetic, and the adapter in
 they control.
 
 Results of SenseLab's own runs are committed under `results/` with the
-deployment, agent, dates and the harness version in `scorecard.json → meta`.
+deployment, agent, dates and the harness version in `scorecard.json → meta`,
+and a `NOTES.md` per run saying what the run was for and what it found.
+The first three dev runs (`senselab-dev-research-agent*`) ended
+`insufficient` because the corpus held no run the record could fail; the
+fourth (`senselab-dev-research-agent-22-probes`, 2026-10-18) ran on a
+corpus with a planted failure and decided every probe: 17 known-wrong
+changes injected, 17 rejected at Tier 1, 0 false accepts (one-sided 95%
+upper bound 13.7%), A/A 0 of 40 false positives against a nominal 7.5%.
+Revert probes and the reward read still wait on a fix the verify sweep
+has proved.
