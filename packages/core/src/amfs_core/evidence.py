@@ -87,6 +87,16 @@ FIRST_STRIKE_MIN_WINS = 3
 #: ``explore`` long after a replacement had been found and validated.
 REGIME_MIN_SUCCESSES = 3
 REGIME_WINDOW_DAYS = 7
+#: With the rule's recent outcomes in hand (``regime_shifted(recent=...)``),
+#: a shift needs this many failures among the newest ``REGIME_RECENT_OUTCOMES``
+#: of them, from distinct sessions. The aggregate record cannot tell one
+#: mislabelled failure from a change in the world: on one deployment a rule
+#: validated ten times read as shifted on a single failure the monitor's
+#: pattern had mislabelled, and a fix was drafted for a policy that had not
+#: changed. Two sessions failing where the rule used to hold is the floor at
+#: which "it stopped working" is a claim about the rule rather than the run.
+REGIME_MIN_FAILURES = 2
+REGIME_RECENT_OUTCOMES = 5
 #: Failures weigh more than successes: trust is easy to lose, slow to rebuild.
 SEVERITY: dict[str, float] = {
     OutcomeType.SUCCESS.value: 1.0,
@@ -118,11 +128,63 @@ def is_known(outcome_type: OutcomeType | str) -> bool:
     return _name(outcome_type) in SEVERITY
 
 
+def recent_failures_confirm_shift(
+    recent: Iterable[Any],
+    *,
+    min_failures: int = REGIME_MIN_FAILURES,
+    window: int = REGIME_RECENT_OUTCOMES,
+) -> bool:
+    """Whether a rule's recent outcomes, newest first, carry a shift.
+
+    *recent* is the rule's outcomes as the caller has them — objects or
+    mappings with ``outcome_type``, a ``session_id`` (``outcome_ref`` or
+    ``trace_id`` will do) and, where the caller knows it, ``verified_by`` or
+    ``verified``. Among the newest *window* of them at least *min_failures*
+    must be failures from distinct sessions; and when any outcome in that
+    window was verified by someone other than the agent, at least one of the
+    counted failures must be — an agent's own reports of failure do not
+    carry a shift past a monitor that is watching and did not fail the rule.
+    A window with no verified outcome at all is read on the reports alone.
+    """
+    newest = list(recent)[: max(1, int(window))]
+    if not newest:
+        return False
+
+    def _get(item: Any, *names: str) -> Any:
+        for name in names:
+            value = item.get(name) if isinstance(item, dict) else getattr(item, name, None)
+            if value not in (None, ""):
+                return value
+        return None
+
+    def _verified(item: Any) -> bool:
+        flag = _get(item, "verified")
+        if isinstance(flag, bool):
+            return flag
+        return bool(_get(item, "verified_by"))
+
+    any_verified = any(_verified(item) for item in newest)
+    sessions: set[str] = set()
+    verified_failure = False
+    for position, item in enumerate(newest):
+        outcome = _get(item, "outcome_type")
+        if outcome is None or not is_known(outcome) or is_success(outcome):
+            continue
+        session = _get(item, "session_id", "outcome_ref", "trace_id", "id")
+        sessions.add(str(session) if session is not None else f"#{position}")
+        verified_failure = verified_failure or _verified(item)
+    if len(sessions) < max(1, int(min_failures)):
+        return False
+    return verified_failure or not any_verified
+
+
 def regime_shifted(
     entry: Any,
     *,
     now: datetime | None = None,
     window_days: int | None = REGIME_WINDOW_DAYS,
+    recent: Iterable[Any] | None = None,
+    min_failures: int = REGIME_MIN_FAILURES,
 ) -> bool:
     """Whether *entry* looks like a rule that used to work and has just stopped.
 
@@ -135,6 +197,16 @@ def regime_shifted(
     not forgive, is. A ratio over the evidence masses cannot draw that line —
     one failure carries severity 2 against a decayed run of successes and
     already reads as half the mass.
+
+    The label forgives one failure only on a record with none before it. A
+    rule with one failure in its history reads ``contested`` on the next, so
+    a single mislabelled run flips a ten-times-validated rule to "shifted"
+    and a fix is drafted for a policy that did not change. A caller that has
+    the rule's recent outcomes passes them as *recent* (newest first; see
+    :func:`recent_failures_confirm_shift`), and the shift then also needs
+    *min_failures* failures among the newest ``REGIME_RECENT_OUTCOMES`` of
+    them, from distinct sessions, verified where verification exists. Without
+    *recent* the aggregate rule stands alone, as before.
 
     The window is what makes this an event rather than a permanent mark: a
     rule discredited last month is history the ``discredited`` section covers,
@@ -149,6 +221,10 @@ def regime_shifted(
     failures = int(getattr(entry, "failure_count", 0) or 0)
     last = getattr(entry, "last_outcome", None)
     if successes < REGIME_MIN_SUCCESSES or failures < 1 or last is None or is_success(last):
+        return False
+    if recent is not None and not recent_failures_confirm_shift(
+        recent, min_failures=min_failures
+    ):
         return False
     if window_days is not None:
         at = getattr(entry, "last_outcome_at", None)
@@ -887,6 +963,9 @@ __all__ = [
     "outcome_model",
     "outcome_steps",
     "posterior",
+    "REGIME_MIN_FAILURES",
+    "REGIME_RECENT_OUTCOMES",
+    "recent_failures_confirm_shift",
     "regime_shifted",
     "replacements_from_lessons",
     "severity",
