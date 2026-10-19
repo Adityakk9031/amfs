@@ -2949,6 +2949,7 @@ async def retrieve_entries(
             sq = SemanticQuery(
                 text=qtext,
                 entity_path=req.entity_path,
+                include_descendants=req.include_descendants,
                 min_confidence=req.min_confidence,
                 limit=pool,
                 embedding=query_vectors.get(qtext),
@@ -2969,6 +2970,7 @@ async def retrieve_entries(
     sq_lex = SearchQuery(
         query=topical,
         entity_path=req.entity_path,
+        include_descendants=req.include_descendants,
         min_confidence=req.min_confidence,
         limit=pool,
         sort_by="confidence",
