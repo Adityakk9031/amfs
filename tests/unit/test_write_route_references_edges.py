@@ -97,6 +97,54 @@ def test_async_write_path_materialises_references_edges(server_bits) -> None:
     assert len(wrote) == 1 and wrote[0].target_entity == "research/drill-derived/child-template"
 
 
+def test_sync_fallback_does_not_materialise_the_edges_twice(server_bits, monkeypatch) -> None:
+    """When the async write fails and ``handle.write`` stores the entry, the
+    sync path has already materialised the ``references`` edges; the
+    background task must not upsert them again, or one write bumps the
+    edge's ``evidence_count`` twice."""
+    from fastapi.testclient import TestClient
+
+    server, spy = server_bits
+
+    async def failing_write(entry):
+        raise RuntimeError("async adapter down")
+
+    monkeypatch.setattr(spy, "write", failing_write)
+    # The sync path materialises its edges on the SDK's background thread;
+    # record what reaches the sync adapter, and drain that thread before
+    # asserting (one worker, FIFO: a no-op submitted after is the barrier).
+    sync_edges: list[GraphEdge] = []
+    monkeypatch.setattr(
+        server._memory._adapter,
+        "upsert_graph_edge",
+        lambda edge, **kw: sync_edges.append(edge),
+    )
+    with TestClient(server.app) as client:
+        r = client.post(
+            "/api/v1/entries",
+            json={
+                "entity_path": "research/drill-derived",
+                "key": "child-template",
+                "value": "derived from the parent rule",
+                "agent_id": "research-agent",
+                "pattern_refs": ["research/drill/parent-rule"],
+            },
+        )
+        assert r.status_code == 200, r.text
+        _settle(client)
+    from amfs.memory import _get_sdk_executor
+
+    _get_sdk_executor().submit(lambda: None).result(timeout=5)
+    assert [e for e in spy.edges if e.relation == "references"] == []
+    # The sync path did its job: the edge reached the graph exactly once.
+    refs = [e for e in sync_edges if e.relation == "references"]
+    assert len(refs) == 1
+    assert (refs[0].source_entity, refs[0].target_entity) == (
+        "research/drill-derived/child-template",
+        "research/drill/parent-rule",
+    )
+
+
 def test_malformed_trace_body_is_a_422_not_a_500(server_bits) -> None:
     from fastapi.testclient import TestClient
 

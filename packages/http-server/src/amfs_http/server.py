@@ -2314,7 +2314,10 @@ async def write_entry(
             # the entry through the adapter directly, so until here a hosted
             # writer's pattern_refs reached the graph only on a backfill, and
             # a failure on the parent never propagated to what cited it.
-            for _ref in _refs:
+            # Only when the async write is the one that stored the entry: on
+            # the sync fallback ``handle.write`` has already materialised them,
+            # and a second upsert would bump ``evidence_count`` for one write.
+            for _ref in _refs if _used_async else ():
                 try:
                     await _async_adapter.upsert_graph_edge(
                         GraphEdge(

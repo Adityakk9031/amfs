@@ -219,41 +219,32 @@ def _scan(text: Any, scanner: Callable[[str], str | None] | None) -> Any:
     return REDACTED if scanned is None else scanned
 
 
+def _redact_tree(value: Any, scanner: Callable[[str], str | None] | None) -> Any:
+    """Run *scanner* over **every** string leaf of *value*, whatever the
+    shape: message ``content`` as text or parts, ``reasoning``, tool-call
+    arguments, tool results, tool schemas, and any field a provider adds
+    that this module has never heard of. Structure is preserved; dict keys
+    are not scanned (they are field names, not text). Enumerating the known
+    text fields was how ``reasoning`` and the ``tools`` schemas were stored
+    unscanned."""
+    if isinstance(value, str):
+        return _scan(value, scanner)
+    if isinstance(value, dict):
+        return {k: _redact_tree(v, scanner) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_redact_tree(v, scanner) for v in value]
+    if isinstance(value, tuple):
+        return [_redact_tree(v, scanner) for v in value]
+    return value
+
+
 def _redact_messages(messages: Any, scanner: Callable[[str], str | None] | None) -> Any:
-    """Scan every text field a message can carry: ``content`` as a string or
-    as parts, tool-call arguments, and tool results. Shape is preserved."""
+    """Scan every text field a message can carry. A list of messages in, the
+    same shape out; kept as the named entry point the tests and the trace
+    builder use, implemented as the structural walk."""
     if not isinstance(messages, list):
         return messages
-    out = []
-    for m in messages:
-        if not isinstance(m, dict):
-            out.append(m)
-            continue
-        mm = dict(m)
-        content = mm.get("content")
-        if isinstance(content, str):
-            mm["content"] = _scan(content, scanner)
-        elif isinstance(content, list):
-            parts = []
-            for part in content:
-                if isinstance(part, dict) and isinstance(part.get("text"), str):
-                    parts.append({**part, "text": _scan(part["text"], scanner)})
-                else:
-                    parts.append(part)
-            mm["content"] = parts
-        if isinstance(mm.get("tool_calls"), list):
-            calls = []
-            for tc in mm["tool_calls"]:
-                if isinstance(tc, dict) and isinstance(tc.get("function"), dict):
-                    fn = dict(tc["function"])
-                    if isinstance(fn.get("arguments"), str):
-                        fn["arguments"] = _scan(fn["arguments"], scanner)
-                    calls.append({**tc, "function": fn})
-                else:
-                    calls.append(tc)
-            mm["tool_calls"] = calls
-        out.append(mm)
-    return out
+    return _redact_tree(messages, scanner)
 
 
 def tool_calls_of(response: dict[str, Any]) -> list[dict[str, Any]]:
@@ -307,17 +298,11 @@ def capture_payload(
     bytes before redaction, so a holder of the original can verify the capture
     is of that exchange; the redacted text itself is what is stored.
     """
-    request = {k: request_body[k] for k in REQUEST_KEYS if k in request_body}
-    if "messages" in request:
-        request["messages"] = _redact_messages(request["messages"], scanner)
-    redacted_response = dict(response or {})
-    if isinstance(redacted_response.get("choices"), list):
-        redacted_response["choices"] = [
-            {**c, "message": _redact_messages([c.get("message") or {}], scanner)[0]}
-            if isinstance(c, dict)
-            else c
-            for c in redacted_response["choices"]
-        ]
+    # The whole of both objects, not the fields known to hold text: tool
+    # schemas, reasoning, provider extensions and anything else a caller sends
+    # or a model returns are stored, so all of it is scanned.
+    request = _redact_tree({k: request_body[k] for k in REQUEST_KEYS if k in request_body}, scanner)
+    redacted_response = _redact_tree(dict(response or {}), scanner)
     payload: dict[str, Any] = {
         "capture_version": CAPTURE_VERSION,
         "source": source,

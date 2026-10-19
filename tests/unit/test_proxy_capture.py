@@ -225,6 +225,50 @@ def test_capture_payload_redacts_every_text_field_and_hashes_raw_bytes():
     assert "sk-live-SECRET" not in json.dumps(payload)
 
 
+def test_capture_redacts_reasoning_tool_schemas_and_unknown_fields():
+    """Every string leaf is scanned, not a list of known text fields: the
+    reasoning a stream reassembles onto the message, the tool schemas the
+    request carries, and provider fields this module has never seen."""
+    req = {
+        **REQ,
+        "tools": [
+            {
+                "type": "function",
+                "function": {
+                    "name": "lookup",
+                    "description": "default token sk-live-SECRET for the sandbox",
+                    "parameters": {"properties": {"token": {"default": "sk-live-SECRET"}}},
+                },
+            }
+        ],
+    }
+    resp = {
+        **RESP,
+        "choices": [
+            {
+                "index": 0,
+                "finish_reason": "stop",
+                "message": {
+                    "role": "assistant",
+                    "content": "done",
+                    "reasoning": "the user's token is sk-live-SECRET so I will",
+                    "provider_extension": {"echo": "sk-live-SECRET"},
+                },
+            }
+        ],
+    }
+    payload = cap.capture_payload(req, resp, scanner=_scanner)
+    tool = payload["request"]["tools"][0]["function"]
+    assert tool["description"] == "default token *** for the sandbox"
+    assert tool["parameters"]["properties"]["token"]["default"] == "***"
+    message = payload["response"]["choices"][0]["message"]
+    assert message["reasoning"] == "the user's token is *** so I will"
+    assert message["provider_extension"]["echo"] == "***"
+    # the untouched fields keep their shape and type
+    assert payload["request"]["temperature"] == REQ["temperature"]
+    assert payload["response"]["usage"] == RESP["usage"]
+
+
 def test_capture_trace_is_a_decision_trace_with_no_outcome():
     payload = cap.capture_payload(REQ, RESP, scanner=_scanner, scope="acme/support")
     trace = cap.capture_trace(
