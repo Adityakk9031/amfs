@@ -2421,3 +2421,32 @@ def test_a_sweep_names_every_untried_candidate_not_the_plans_cut() -> None:
     # plan was drawn from — so the two agree when the plan is this build's.
     order = act.sweep_order(pr, pr["untried"], "support-agent")
     assert [a for a in order if a in rec["plan"]] == [a for a in rec["plan"] if a in order]
+
+
+def test_recommend_thresholds_are_keywords_defaulting_to_the_constants() -> None:
+    """t2-11b (OSS half). ``act`` is read through ``min_p`` / ``min_n``, which
+    default to ``ACT_MIN_P`` / ``ACT_MIN_N`` so nothing changes for a caller that
+    passes nothing. A caller that has calibrated the thresholds on its own
+    outcomes passes them: a stricter pair withholds ``act`` from a record the
+    defaults would act on — the recommendation has nothing to say rather than
+    naming a weaker winner — and the plan drawn from the same record agrees."""
+    cands = ["resolve:b", "resolve:c"]
+    pr = {"tried": [_prior("resolve:b", 2, 3, ["lost", "won", "won"])], "untried": ["resolve:c"]}
+    default = act.recommend(pr, agent_id="x", candidate_actions=cands)
+    assert default["mode"] == "act" and default["suggested_action"] == "resolve:b"
+    assert default["plan"][0] == "resolve:b"
+    same = act.recommend(pr, agent_id="x", candidate_actions=cands, min_p=act.ACT_MIN_P, min_n=act.ACT_MIN_N)
+    assert same == default
+    # 2/3 (p .667) clears ACT_MIN_P .6 but not a calibrated .7: no winner, and
+    # one loss on a 2/3 is not "everything failed" either, so nothing is said.
+    assert act.recommend(pr, agent_id="x", candidate_actions=cands, min_p=0.7) is None
+    # A higher min_n alone does the same: three takes are not the five asked for.
+    assert act.recommend(pr, agent_id="x", candidate_actions=cands, min_n=5) is None
+    # The plan reads the same gate: under the calibrated pair resolve:b is no
+    # winner and its newest take lost, so the untried candidate leads.
+    assert act.plan_actions(pr, None, agent_id="x", candidate_actions=cands)[0] == "resolve:b"
+    assert act.plan_actions(pr, None, agent_id="x", candidate_actions=cands, min_p=0.7)[0] == "resolve:c"
+    # The exact-situation first win is not read through the gate at all, so it
+    # is unaffected by either threshold — the gate is for pooled records.
+    exact = {"tried": [dict(_prior("resolve:b", 1, 1, ["won"]), situation_exact=True)], "untried": ["resolve:c"]}
+    assert act.recommend(exact, agent_id="x", candidate_actions=cands, min_p=0.99, min_n=50)["mode"] == "act"

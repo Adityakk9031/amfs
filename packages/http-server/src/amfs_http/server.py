@@ -2270,6 +2270,7 @@ async def write_entry(
     _ns = _async_adapter._namespace if _async_adapter else mem.namespace
     _branch = entry.branch or "main"
     _confidence = entry.confidence
+    _refs = [r for r in (req.pattern_refs or []) if isinstance(r, str) and "/" in r and r != _ek]
 
     if _async_adapter is not None:
         async def _bg_async_side_effects() -> None:
@@ -2307,6 +2308,28 @@ async def write_entry(
                 )
             except Exception:
                 logger.debug("bg: Failed to materialize wrote edge", exc_info=True)
+            # ``references`` edges from pattern_refs — the graph
+            # ``propagate_failure`` walks. The sync path gets them from
+            # ``AgentMemory._materialize_pattern_ref_edges``; this path writes
+            # the entry through the adapter directly, so until here a hosted
+            # writer's pattern_refs reached the graph only on a backfill, and
+            # a failure on the parent never propagated to what cited it.
+            for _ref in _refs:
+                try:
+                    await _async_adapter.upsert_graph_edge(
+                        GraphEdge(
+                            source_entity=_ek,
+                            source_type="entry",
+                            relation="references",
+                            target_entity=_ref,
+                            target_type="entry",
+                            provenance={"agent_id": _agent, "trigger": "write"},
+                        ),
+                        namespace=_ns,
+                        branch=_branch,
+                    )
+                except Exception:
+                    logger.debug("bg: Failed to materialize references edge for %s", _ref, exc_info=True)
 
         asyncio.create_task(_bg_async_side_effects())
     else:
@@ -5313,7 +5336,14 @@ async def save_trace(
 ) -> dict[str, Any]:
     """Persist a decision trace (used by HttpAdapter.save_trace)."""
     body = await req.json()
-    trace = DecisionTrace.model_validate(body)
+    # The body is read raw (the seal below prefers it to the parsed model), so
+    # validation is explicit here and a malformed trace is a 422 naming the
+    # field, as it would be for a typed body — not a 500 with the detail in
+    # the server log only.
+    try:
+        trace = DecisionTrace.model_validate(body)
+    except ValidationError as exc:
+        raise HTTPException(status_code=422, detail=exc.errors(include_url=False)) from exc
     mem = _get_memory()
     if trace.agent_id:
         _link_agent_owner_once(req, trace.agent_id, mem.namespace)

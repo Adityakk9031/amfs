@@ -274,6 +274,14 @@ _LOCAL_EVIDENCE_SQL = (
 _OUTCOME_TASK_TEXT_SQL = (
     Path(__file__).parent / "migrations" / "011_outcome_task_text.sql"
 ).read_text(encoding="utf-8")
+#: Migration 012 — the evidence functions rendered from ``amfs_core.evidence``
+#: (``evidence_sql.render_evidence_sql``), replacing the hand-written bodies
+#: of 008/009 with the same arithmetic read off the Python model. Applied
+#: last so its CREATE OR REPLACE is what stands; folded into the fingerprint
+#: so a regenerated file re-applies.
+_EVIDENCE_FROM_MODEL_SQL = (
+    Path(__file__).parent / "migrations" / "012_evidence_from_model.sql"
+).read_text(encoding="utf-8")
 #: Characters of ``task_input`` kept on the outcome row. Read for word
 #: statistics — which of a query's words recur across this entity's tasks —
 #: so the head of the request is all that is needed, and a pasted log or
@@ -949,7 +957,7 @@ class PostgresAdapter(AdapterABC):
         return hashlib.sha256(
             (
                 _SCHEMA_SQL + migrations + _OUTCOME_EVIDENCE_SQL + _ACTION_PRIORS_SQL
-                + _LOCAL_EVIDENCE_SQL + _OUTCOME_TASK_TEXT_SQL
+                + _LOCAL_EVIDENCE_SQL + _OUTCOME_TASK_TEXT_SQL + _EVIDENCE_FROM_MODEL_SQL
             ).encode("utf-8")
         ).hexdigest()
 
@@ -1317,6 +1325,8 @@ class PostgresAdapter(AdapterABC):
         cur.execute(_LOCAL_EVIDENCE_SQL)
         # The task text on outcomes: see migration 011.
         cur.execute(_OUTCOME_TASK_TEXT_SQL)
+        # The evidence functions from the Python model: see migration 012.
+        cur.execute(_EVIDENCE_FROM_MODEL_SQL)
         # task_embedding on outcomes follows the entries' embedding dimension,
         # so it is derived here rather than declared in the migration.
         cur.execute(
