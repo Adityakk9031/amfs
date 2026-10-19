@@ -962,10 +962,17 @@ class SemanticQuery(BaseModel):
     it. An adapter given one must use it instead of embedding ``text`` again:
     the server embeds once, off its event loop, and reuses the vector across
     the variant and below-gate reads of a single retrieve.
+
+    ``include_descendants`` widens ``entity_path`` from an exact match to
+    that path and everything beneath it, as :class:`SearchQuery` does and by
+    the same rule (``amfs_core.scope.covers``). Off by default; the caller
+    that wants it is one whose scope is a prefix rather than an entity — a
+    model trained on ``research/*`` serving a request that names no path.
     """
 
     text: str
     entity_path: str | None = None
+    include_descendants: bool = False
     min_confidence: float = 0.0
     max_confidence: float | None = None
     limit: int = 10

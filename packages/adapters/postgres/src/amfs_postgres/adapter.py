@@ -2659,8 +2659,13 @@ class PostgresAdapter(AdapterABC):
         params: list[Any] = [self._namespace]
 
         if query.entity_path is not None:
-            conditions.append("entity_path = %s")
-            params.append(query.entity_path)
+            if getattr(query, "include_descendants", False):
+                clause, clause_params = descendants_sql("entity_path", query.entity_path)
+                conditions.append(clause)
+                params.extend(clause_params)
+            else:
+                conditions.append("entity_path = %s")
+                params.append(query.entity_path)
         else:
             conditions.append(_EXCLUDE_SHARED_PATHS)
         if query.min_confidence > 0:

@@ -231,7 +231,7 @@ requires-dist = [
 
 [[package]]
 name = "amfs-adapter-postgres"
-version = "0.2.35"
+version = "0.2.36"
 source = { editable = "packages/adapters/postgres" }
 dependencies = [
     { name = "amfs-core" },
@@ -330,7 +330,7 @@ provides-extras = ["cli"]
 
 [[package]]
 name = "amfs-core"
-version = "0.3.48"
+version = "0.3.49"
 source = { editable = "packages/core" }
 dependencies = [
     { name = "pydantic" },
@@ -395,7 +395,7 @@ provides-extras = ["crewai"]
 
 [[package]]
 name = "amfs-http-server"
-version = "0.3.56"
+version = "0.3.57"
 source = { editable = "packages/http-server" }
 dependencies = [
     { name = "amfs" },
