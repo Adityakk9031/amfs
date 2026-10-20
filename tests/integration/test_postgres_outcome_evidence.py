@@ -465,3 +465,59 @@ def test_learning_series_counts_entries_cited_only_in_failed_attempts(adapter, m
     series = adapter.learning_series(since=since, agent="a")
     assert [s["key"] for s in series["shifts"]] == ["stale"]
     assert series["shifts"][0]["at"] == stale.discredited_at
+
+
+# ── 013: verified_by onto the outcomes that predate the column ──────────
+
+
+def test_verified_by_backfill_copies_from_the_trace_once(adapter, monkeypatch) -> None:
+    """An outcome committed before 012 has NULL ``verified_by`` while its
+    sealed trace carries the attribute. The backfill copies it across for
+    those rows only, leaves a never-verified outcome NULL, records the pass,
+    and does nothing on the next application."""
+    from amfs_postgres.adapter import _VERIFIED_BY_BACKFILL_SQL
+
+    monkeypatch.delenv(ev.OUTCOME_MODEL_ENV, raising=False)
+    adapter.write(_entry("rule", 0.9))
+    graded = _record(OutcomeType.SUCCESS, ["svc/mod/rule"])
+    graded.session_metadata = {"attributes": {"verified_by": "driver-monitor"}}
+    adapter.commit_outcome(graded)
+    own_word = _record(OutcomeType.SUCCESS, ["svc/mod/rule"])
+    adapter.commit_outcome(own_word)
+
+    with adapter._pool.connection() as conn, conn.cursor() as cur:
+        # The trace the SDK seals beside the outcome, with the attribute.
+        cur.execute(
+            """INSERT INTO amfs_decision_traces
+                   (namespace, agent_id, session_id, outcome_ref, outcome_type, session_metadata)
+               VALUES (%s, 'a', 'sess-1', %s, 'success', %s::jsonb)""",
+            (adapter._namespace, graded.outcome_ref, '{"attributes": {"verified_by": "driver-monitor"}}'),
+        )
+        # Pre-012 state: the column exists but nothing was written to it.
+        cur.execute(
+            "UPDATE amfs_outcomes SET verified_by = NULL WHERE namespace = %s", (adapter._namespace,)
+        )
+        cur.execute("DELETE FROM amfs_backfills WHERE name = '013_outcome_verified_by'")
+
+        cur.execute(_VERIFIED_BY_BACKFILL_SQL)
+        cur.execute(
+            "SELECT outcome_ref, verified_by FROM amfs_outcomes WHERE namespace = %s ORDER BY id",
+            (adapter._namespace,),
+        )
+        rows = {r["outcome_ref"]: r["verified_by"] for r in cur.fetchall()}
+        assert rows == {graded.outcome_ref: "driver-monitor", own_word.outcome_ref: None}
+        cur.execute("SELECT rows_written FROM amfs_backfills WHERE name = '013_outcome_verified_by'")
+        row = cur.fetchone()
+        assert row is not None and row["rows_written"] >= 1
+
+        # Marked done: a second application changes nothing, even after the
+        # column is cleared again — the pass is one-time by design.
+        cur.execute(
+            "UPDATE amfs_outcomes SET verified_by = NULL WHERE namespace = %s", (adapter._namespace,)
+        )
+        cur.execute(_VERIFIED_BY_BACKFILL_SQL)
+        cur.execute(
+            "SELECT count(*) AS n FROM amfs_outcomes WHERE namespace = %s AND verified_by IS NOT NULL",
+            (adapter._namespace,),
+        )
+        assert cur.fetchone()["n"] == 0
