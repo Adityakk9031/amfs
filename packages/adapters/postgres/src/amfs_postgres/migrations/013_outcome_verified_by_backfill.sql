@@ -19,7 +19,9 @@
 --
 -- Guarded for a database that has no traces table yet (a fresh bootstrap
 -- applies this before anything is sealed; there is nothing to copy) and for
--- one whose adapter has not added `session_metadata` to the traces.
+-- one whose adapter has not added `session_metadata` to the traces. Under
+-- row-level security it does nothing and is not marked done — the hosted
+-- product runs the same pass per tenant from its own migration.
 
 CREATE TABLE IF NOT EXISTS amfs_backfills (
     name TEXT PRIMARY KEY,
@@ -49,6 +51,21 @@ BEGIN
     THEN
         -- Nothing to copy from, or to. Not marked done: the pass should run
         -- once the column exists, on the next application.
+        RETURN;
+    END IF;
+    -- Under row-level security a session that names no tenant reads no rows,
+    -- and a pass that read nothing must not be recorded as done. The hosted
+    -- product has policies on both tables and runs this pass per tenant from
+    -- its own migration, which knows the accounts; a self-hosted database has
+    -- no policies and runs it here. A role that bypasses them may run it too.
+    IF EXISTS (
+           SELECT 1 FROM pg_class c
+           WHERE c.oid IN ('amfs_outcomes'::regclass, 'amfs_decision_traces'::regclass)
+             AND c.relrowsecurity)
+       AND NOT EXISTS (
+           SELECT 1 FROM pg_roles r
+           WHERE r.rolname = current_user AND (r.rolsuper OR r.rolbypassrls))
+    THEN
         RETURN;
     END IF;
     by_account := EXISTS (
