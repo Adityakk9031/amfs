@@ -147,6 +147,31 @@ class TestRecovery:
         assert rec["shifts"] == 1 and rec["measured"] == 0
         assert rec["events"][0]["measured"] is False
         assert rec["events"][0]["before"] == 2
+        assert rec["events"][0]["reason"] == "short_before"
+        out = learning.learning_curve(
+            _rows("sssss" + "ss"), shifts=[{"key": "rule", "at": T0 + timedelta(hours=5)}], window=10
+        )
+        assert out["recovery"]["events"][0]["reason"] == "short_after"
+
+    def test_a_zero_bar_is_not_something_to_recover_to(self) -> None:
+        # Read on dev: "refund-policy changed · back to 0% in 3 sessions". The
+        # agent failed every session before the shift, so any rolling rate
+        # clears the bar at once. That is improvement on the curve, not
+        # recovery from the change; the shift is reported, not measured.
+        rows = _rows("ffffff" + "fffsss")
+        out = learning.learning_curve(
+            rows, shifts=[{"key": "rule", "at": T0 + timedelta(hours=6)}], window=10
+        )
+        rec = out["recovery"]
+        assert rec["shifts"] == 1 and rec["measured"] == 0 and rec["recovered"] == 0
+        assert rec["median_sessions_to_recover"] is None and rec["open"] == []
+        event = rec["events"][0]
+        assert event["bar"] == 0.0 and event["measured"] is False and event["reason"] == "no_bar"
+        # One success before the shift is a bar, and the measurement runs.
+        out = learning.learning_curve(
+            _rows("fffffs" + "fffsss"), shifts=[{"key": "rule", "at": T0 + timedelta(hours=6)}], window=10
+        )
+        assert out["recovery"]["measured"] == 1 and out["recovery"]["events"][0]["reason"] is None
 
     def test_the_median_is_over_recovered_shifts_only(self) -> None:
         before = "ssssssssss"

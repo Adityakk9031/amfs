@@ -282,6 +282,12 @@ _OUTCOME_TASK_TEXT_SQL = (
 _EVIDENCE_FROM_MODEL_SQL = (
     Path(__file__).parent / "migrations" / "012_evidence_from_model.sql"
 ).read_text(encoding="utf-8")
+#: Migration 013 — ``verified_by`` copied from the sealed trace onto the
+#: outcomes committed before 012 gave them the column. One pass, recorded in
+#: ``amfs_backfills``; every later application returns at the first SELECT.
+_VERIFIED_BY_BACKFILL_SQL = (
+    Path(__file__).parent / "migrations" / "013_outcome_verified_by_backfill.sql"
+).read_text(encoding="utf-8")
 #: Characters of ``task_input`` kept on the outcome row. Read for word
 #: statistics — which of a query's words recur across this entity's tasks —
 #: so the head of the request is all that is needed, and a pasted log or
@@ -965,6 +971,7 @@ class PostgresAdapter(AdapterABC):
             (
                 _SCHEMA_SQL + migrations + _OUTCOME_EVIDENCE_SQL + _ACTION_PRIORS_SQL
                 + _LOCAL_EVIDENCE_SQL + _OUTCOME_TASK_TEXT_SQL + _EVIDENCE_FROM_MODEL_SQL
+                + _VERIFIED_BY_BACKFILL_SQL
             ).encode("utf-8")
         ).hexdigest()
 
@@ -1334,6 +1341,10 @@ class PostgresAdapter(AdapterABC):
         cur.execute(_OUTCOME_TASK_TEXT_SQL)
         # The evidence functions from the Python model: see migration 012.
         cur.execute(_EVIDENCE_FROM_MODEL_SQL)
+        # verified_by onto the outcomes that predate the column: see 013.
+        # After 012 (the column) and after the traces gained session_metadata
+        # above, which is where the value is copied from.
+        cur.execute(_VERIFIED_BY_BACKFILL_SQL)
         # task_embedding on outcomes follows the entries' embedding dimension,
         # so it is derived here rather than declared in the migration.
         cur.execute(

@@ -95,7 +95,12 @@ def recovery_after(
     ``sessions_to_recover`` is how many sessions after it the rolling rate
     (over the last ``window`` of them, once there are ``min_sessions``) took
     to reach the bar, or ``None`` while it has not. ``measured`` is False when
-    either side is too short to say anything.
+    there is nothing to measure, and ``reason`` says why: ``short_before`` or
+    ``short_after`` when a side has fewer than ``min_sessions``, ``no_bar``
+    when the agent was failing every session before the shift — a rolling
+    rate is always at or above zero, so "back to 0 %" would be a recovery
+    claimed for free. What follows a no-bar shift is improvement, read off
+    the curve, not recovery.
     """
     before = [ok for (t, ok, _v) in sessions if t < at][-window:]
     after = [ok for (t, ok, _v) in sessions if t >= at]
@@ -105,11 +110,19 @@ def recovery_after(
         "after": len(after),
         "bar": _rate(before),
         "measured": False,
+        "reason": None,
         "recovered": False,
         "sessions_to_recover": None,
         "rate_after": _rate(after[-window:]),
     }
-    if len(before) < min_sessions or len(after) < min_sessions:
+    if len(before) < min_sessions:
+        out["reason"] = "short_before"
+        return out
+    if len(after) < min_sessions:
+        out["reason"] = "short_after"
+        return out
+    if not any(before):
+        out["reason"] = "no_bar"
         return out
     out["measured"] = True
     bar = out["bar"]
