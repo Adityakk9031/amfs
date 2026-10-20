@@ -220,3 +220,180 @@ def test_an_attempt_charges_the_claim_it_tried_and_the_success_goes_to_the_fix(
     live = adapter.read("svc/mod", "rule")
     assert live.value == {"rule": "corrected"}
     assert (live.success_count, live.failure_count) == (1, 0)
+
+
+# ── Verification and credit by uplift (012) ─────────────────────────────
+
+
+def _verified(record: OutcomeRecord, by: str) -> OutcomeRecord:
+    record.session_metadata = {"attributes": {"verified_by": by}}
+    return record
+
+
+def test_a_verified_outcome_weighs_more_than_the_agents_own_word(adapter, monkeypatch) -> None:
+    """Two identical entries, two identical failures — one declared by the
+    agent, one decided by CI. The verified one moves its entry further, by
+    VERIFIED_EVIDENCE_WEIGHT, and the SQL agrees with the Python model on both."""
+    monkeypatch.delenv(ev.OUTCOME_MODEL_ENV, raising=False)
+    told = adapter.write(_entry("told", 0.8))
+    proven = adapter.write(_entry("proven", 0.8))
+    r_told = _record(OutcomeType.FAILURE, ["svc/mod/told"])
+    r_proven = _verified(_record(OutcomeType.FAILURE, ["svc/mod/proven"]), "ci")
+    adapter.commit_outcome(r_told)
+    adapter.commit_outcome(r_proven)
+    got_told = adapter.read("svc/mod", "told")
+    got_proven = adapter.read("svc/mod", "proven")
+    assert got_proven.evidence_failure == pytest.approx(
+        got_told.evidence_failure * ev.VERIFIED_EVIDENCE_WEIGHT, abs=1e-4
+    )
+    assert got_proven.confidence < got_told.confidence
+    assert got_told.evidence_failure == pytest.approx(
+        _expect(told, r_told).evidence_failure, abs=1e-4
+    )
+    assert got_proven.evidence_failure == pytest.approx(
+        _expect(proven, r_proven).evidence_failure, abs=1e-4
+    )
+    with adapter._pool.connection() as conn:
+        rows = conn.execute(
+            "SELECT outcome_ref, verified_by FROM amfs_outcomes WHERE namespace = %s",
+            (adapter._namespace,),
+        ).fetchall()
+    assert {r["outcome_ref"]: r["verified_by"] for r in rows} == {
+        r_told.outcome_ref: None,
+        r_proven.outcome_ref: "ci",
+    }
+
+
+def test_credit_follows_uplift(adapter, monkeypatch) -> None:
+    """Sessions that read ``good`` succeed; sessions that read ``bad`` fail.
+    Once the entity's record says so, a success citing both hands ``good`` its
+    full share and ``bad`` less, and a failure citing both charges ``bad`` in
+    full and ``good`` less. Uniform credit would move the two identically."""
+    monkeypatch.delenv(ev.OUTCOME_MODEL_ENV, raising=False)
+    adapter.write(_entry("good", 0.6))
+    adapter.write(_entry("bad", 0.6))
+    history = []
+    for _ in range(6):
+        history.append(_record(OutcomeType.SUCCESS, ["svc/mod/good"]))
+        history.append(_record(OutcomeType.FAILURE, ["svc/mod/bad"]))
+    for rec in history:
+        adapter.commit_outcome(rec)
+    good = adapter.read("svc/mod", "good")
+    bad = adapter.read("svc/mod", "bad")
+    assert good.uplift is not None and good.uplift > 0
+    assert bad.uplift is not None and bad.uplift < 0
+    # Each row carries the uplift as of the last outcome that cited it: ``good``
+    # was last cited by the eleventh outcome (six reads, five unread so far),
+    # ``bad`` by the twelfth. The stored value is the reference definition
+    # over the outcomes committed by then.
+    assert (good.uplift_sessions, bad.uplift_sessions) == (5, 6)
+    at_good = ev.uplift_counts(history[:11], "svc/mod", ["good"])["good"]
+    at_bad = ev.uplift_counts(history, "svc/mod", ["bad"])["bad"]
+    assert (good.uplift, good.uplift_sessions) == (pytest.approx(at_good[0], abs=1e-9), at_good[1])
+    assert (bad.uplift, bad.uplift_sessions) == (pytest.approx(at_bad[0], abs=1e-9), at_bad[1])
+
+    both = _record(OutcomeType.SUCCESS, ["svc/mod/good", "svc/mod/bad"])
+    adapter.commit_outcome(both)
+    good2 = adapter.read("svc/mod", "good")
+    bad2 = adapter.read("svc/mod", "bad")
+    gained_good = good2.evidence_success - good.evidence_success * ev.EVIDENCE_DECAY
+    gained_bad = bad2.evidence_success - bad.evidence_success * ev.EVIDENCE_DECAY
+    # Per unit of surprise (``bad`` sits lower, so a success on it is the more
+    # surprising), ``bad`` received less of the split than ``good``...
+    surprise_good = 1.0 + (1.0 - good.confidence)
+    surprise_bad = 1.0 + (1.0 - bad.confidence)
+    assert gained_bad / surprise_bad < gained_good / surprise_good
+    # ...by exactly the credit the model computes from the uplift it carried:
+    # severity 1 * causal 1 * credit / 2 keys * surprise.
+    expect_good = ev.uplift_credit(good.uplift, good.uplift_sessions, success=True)
+    expect_bad = ev.uplift_credit(bad.uplift, bad.uplift_sessions, success=True)
+    assert expect_good == 1.0 and ev.UPLIFT_FLOOR <= expect_bad < 1.0
+    assert gained_good == pytest.approx(expect_good / 2 * surprise_good, abs=1e-3)
+    assert gained_bad == pytest.approx(expect_bad / 2 * surprise_bad, abs=1e-3)
+    # And the SQL agrees with the Python model step for step, each row's own
+    # confidence and uplift going into its weight.
+    want_good = _expect(good, both)
+    want_bad = _expect(bad, both)
+    assert good2.evidence_success == pytest.approx(want_good.evidence_success, abs=1e-4)
+    assert bad2.evidence_success == pytest.approx(want_bad.evidence_success, abs=1e-4)
+
+
+def test_uplift_is_refreshed_only_for_the_keys_an_outcome_cites(adapter, monkeypatch) -> None:
+    """Credit is read at citation time, so the refresh is per cited key. An
+    entry on the entity no outcome has cited yet keeps the uniform split."""
+    monkeypatch.delenv(ev.OUTCOME_MODEL_ENV, raising=False)
+    adapter.write(_entry("cited", 0.6))
+    adapter.write(_entry("bystander", 0.6))
+    adapter.commit_outcome(_record(OutcomeType.SUCCESS, ["svc/mod/cited"]))
+    adapter.commit_outcome(_record(OutcomeType.FAILURE, ["svc/mod/other"]))
+    adapter.commit_outcome(_record(OutcomeType.SUCCESS, ["svc/mod/cited"]))
+    cited = adapter.read("svc/mod", "cited")
+    bystander = adapter.read("svc/mod", "bystander")
+    assert cited.uplift == pytest.approx(1.0) and cited.uplift_sessions == 1
+    assert bystander.uplift is None and bystander.uplift_sessions == 0
+    assert bystander.version == 1
+
+
+# ── The learning series (GET /api/v1/learning reads this) ───────────────
+
+
+def test_learning_series_returns_the_sessions_in_order_and_the_shifts_among_cited_entries(
+    adapter, monkeypatch
+) -> None:
+    from datetime import timedelta
+
+    from amfs_core.learning import learning_curve
+
+    monkeypatch.delenv(ev.OUTCOME_MODEL_ENV, raising=False)
+    adapter.write(_entry("rule", 0.9))
+    adapter.write(_entry("other", 0.9))
+    shifted_at = None
+    for outcome in [OutcomeType.SUCCESS] * 4 + [OutcomeType.FAILURE] * 2 + [OutcomeType.SUCCESS] * 3:
+        rec = _record(outcome, ["svc/mod/rule"])
+        if outcome is OutcomeType.FAILURE:
+            rec.session_metadata = {"attributes": {"verified_by": "ci"}}
+        adapter.commit_outcome(rec)
+        if outcome is OutcomeType.FAILURE:
+            # The second CI-graded failure discredits the rule: that moment is
+            # the shift, and it stays in the version history after the three
+            # successes that follow lift the flag again.
+            shifted_at = adapter.read("svc/mod", "rule").discredited_at or shifted_at
+    assert shifted_at is not None
+    # Another agent's outcome, and one on another entity, for the scoping.
+    rec = _record(OutcomeType.FAILURE, ["svc/mod/other"])
+    rec.agent_id = "b"
+    adapter.commit_outcome(rec)
+    rec = _record(OutcomeType.SUCCESS, ["elsewhere/thing/k"])
+    adapter.commit_outcome(rec)
+    assert adapter.read("svc/mod", "rule").discredited_at is None
+
+    since = datetime.now(UTC) - timedelta(days=1)
+    series = adapter.learning_series(since=since, agent="a")
+    assert [s["outcome_type"] for s in series["sessions"]] == (
+        ["success"] * 4 + ["failure"] * 2 + ["success"] * 3 + ["success"]
+    )
+    assert [s["verified_by"] for s in series["sessions"]].count("ci") == 2
+    ats = [s["at"] for s in series["sessions"]]
+    assert ats == sorted(ats)
+    assert [(s["entity_path"], s["key"]) for s in series["shifts"]] == [("svc/mod", "rule")]
+    assert series["shifts"][0]["at"] == shifted_at
+
+    # The curve reads straight off it.
+    curve = learning_curve(series["sessions"], shifts=series["shifts"], window=4)
+    assert curve["sessions"] == 10
+    assert curve["recovery"]["shifts"] == 1
+    assert curve["verified_share"] == 0.2
+
+    # Scoping: the entity narrows; the visibility scope bounds; agent narrows on top.
+    on_entity = adapter.learning_series(since=since, entity_path="svc/mod")
+    assert len(on_entity["sessions"]) == 10  # a's nine on the rule plus b's one on other
+    assert len(adapter.learning_series(since=since, entity_path="elsewhere/thing")["sessions"]) == 1
+    assert adapter.learning_series(since=since, visible_agents=set()) == {"sessions": [], "shifts": []}
+    assert adapter.learning_series(since=since, agent="a", visible_agents={"b"}) == {
+        "sessions": [],
+        "shifts": [],
+    }
+    only_b = adapter.learning_series(since=since, visible_agents={"b"})
+    assert [s["agent_id"] for s in only_b["sessions"]] == ["b"]
+    # b's one failure discredited ``other``; b never cited the rule.
+    assert [(s["entity_path"], s["key"]) for s in only_b["shifts"]] == [("svc/mod", "other")]

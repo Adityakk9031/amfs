@@ -1744,9 +1744,11 @@ def amfs_commit_outcome(
         verified_by: Optional. Who or what decided the outcome when it was not
             you: "ci" (the pipeline went green), "human" (the user confirmed),
             "verifier" (a check you ran), "customer". An outcome with it is
-            external evidence; one without is your own declaration, and the
-            two are weighed differently when a fix is judged. Leave it out
-            when you are the one calling it a success.
+            external evidence; one without is your own declaration. A
+            verified outcome moves the memories it relied on 1.5x further
+            than your own word, and the two are weighed differently when a
+            fix is judged. Leave it out when you are the one calling it a
+            success.
         evidence: Optional small dict of pointers to that source, e.g.
             {"run_id": "1234", "url": "https://ci/..."}. Scalars only.
 

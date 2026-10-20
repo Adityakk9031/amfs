@@ -47,6 +47,8 @@ AMFS exposes memory three ways: the **MCP server** (for agents), the **Python SD
 | Record action | `amfs_record_action` | `record_action` | `recordAction` (tracker) |
 | Mark a failed attempt before trying another | `amfs_record_attempt` | `record_attempt` | — |
 | Reuse over a window (what was read back, by whom, written by whom) | — | — (HTTP `GET /api/v1/reuse?days=&agent=&writer=`) | — (same endpoint through the `HttpAdapter`) |
+| Verified outcome (weighs 1.5× the agent's own word) | `amfs_commit_outcome(verified_by=)` | `commit_outcome(verified_by=)` | `commitOutcome(ref, type, { attributes: { verified_by } })` |
+| Learning curve: success over sessions, recovery after shifts, verified share | — | — (HTTP `GET /api/v1/learning?days=&agent=&entity_path=&window=&episodes=`) | — (same endpoint through the `HttpAdapter`) |
 | Explain session | `amfs_explain` | `explain` | `explain` |
 | Timeline | `amfs_timeline` | `timeline` | `timelineAsync` |
 | List traces | `amfs_list_traces` | `list_traces` (cursor / since / until) | `listTracesAsync`, `listTracesPageAsync` (`{traces, nextCursor, hasMore}`) |

@@ -1573,7 +1573,10 @@ class AgentMemory:
         *verified_by* says where the outcome came from when the agent did not
         decide it itself — ``"ci"``, ``"human"``, ``"verifier"``, ``"customer"``.
         An outcome with it is external evidence; one without is the agent's own
-        declaration, and the repair loop's canary treats the two differently.
+        declaration. The two are weighed differently everywhere: a verified
+        outcome moves the evidence behind the entries it cites by
+        ``amfs_core.evidence.VERIFIED_EVIDENCE_WEIGHT`` (1.5x) over the agent's
+        word, and the repair loop's canary treats the two differently.
         *evidence* is a small bag of pointers to that source (``{"run_id": ...,
         "url": ...}``). Both travel as session attributes — ``verified_by`` and
         ``evidence_<key>`` — so they reach the sealed trace on every path.

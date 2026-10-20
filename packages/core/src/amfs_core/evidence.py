@@ -19,13 +19,33 @@ where ``prior`` is the confidence the author wrote and ``E_s`` / ``E_f`` are
 evidence masses that decay by ``EVIDENCE_DECAY`` on every update, so the last
 few outcomes dominate. Each outcome adds a weight
 
-    w = severity(outcome_type) * causal_confidence / n_causal * (1 + |target - confidence|)
+    w = severity(outcome_type) * causal_confidence * credit / n_causal
+        * (1 + |target - confidence|) * verification
 
-to one of the masses. The last factor is the *surprise*: a failure on an entry
-the agent trusted at 0.95 counts nearly twice as much as one on an entry at
-0.5, and a success on an already-trusted entry counts for little. Dividing by
-``n_causal`` is the *credit split*: an outcome that cited eight entries cannot
-hand each of them a full unit of evidence.
+to one of the masses. ``(1 + |target - confidence|)`` is the *surprise*: a
+failure on an entry the agent trusted at 0.95 counts nearly twice as much as
+one on an entry at 0.5, and a success on an already-trusted entry counts for
+little. Dividing by ``n_causal`` is the *credit split*: an outcome that cited
+eight entries cannot hand each of them a full unit of evidence.
+
+``credit`` is the entry's share of that split, by *uplift*: over the entity's
+recent sessions, how much more often the ones that read this entry succeeded
+than the ones that did not (:func:`uplift_credit`). A uniform split hands the
+one entry that mattered and the eleven that did not the same evidence. With
+uplift an entry whose presence tracks success keeps its full share of a
+success and is charged less for a failure; an entry whose presence tracks
+failure is charged in full and credited less. The measurement is shrunk
+toward uniform while the sample is small and floored at ``UPLIFT_FLOOR``, so
+it reorders credit and never silences an entry. An adapter that keeps
+outcomes maintains ``MemoryEntry.uplift`` (:func:`uplift_from_counts`); one
+that does not leaves it unset and the split stays uniform.
+
+``verification`` is :data:`VERIFIED_EVIDENCE_WEIGHT` when the outcome was
+decided outside the agent — ``verified_by`` set to CI, a monitor, a reviewer,
+a customer — and 1 when the agent declared it itself. The agent's opinion of
+its own run is evidence, but an engine whose reward is only that opinion
+grades its own homework; a verified outcome is the stronger signal and moves
+the evidence more.
 
 One exception to the surprise term: the *first* failure of an entry that has
 at least ``FIRST_STRIKE_MIN_WINS`` successes and no failure yet is weighed
@@ -53,7 +73,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any, Callable, Iterable
 
 from amfs_core.models import (
@@ -109,6 +129,21 @@ SEVERITY: dict[str, float] = {
     OutcomeType.P1_INCIDENT.value: 3.0,
 }
 SUCCESS_TYPES = frozenset({OutcomeType.SUCCESS.value, OutcomeType.CLEAN_DEPLOY.value})
+#: How much more an outcome decided outside the agent weighs than the agent's
+#: own declaration (``verified_by`` on the outcome; see the module docstring).
+#: 1.5: a CI failure moves an entry half again as far as "the agent says it
+#: failed". Not an environment variable: the SQL rendering carries the same
+#: constant and the two must agree.
+VERIFIED_EVIDENCE_WEIGHT = 1.5
+#: Credit by uplift. ``UPLIFT_WINDOW`` recent outcomes on the entity are the
+#: sample; ``UPLIFT_SHRINK`` is the sample size at which a measured uplift
+#: counts half (``n / (n + UPLIFT_SHRINK)``), so a handful of sessions barely
+#: move the split; ``UPLIFT_FLOOR`` is the least share an entry keeps, so a
+#: disfavoured entry is still charged and credited, just less.
+UPLIFT_WINDOW = 500
+UPLIFT_WINDOW_DAYS = 90
+UPLIFT_SHRINK = 10
+UPLIFT_FLOOR = 0.25
 
 OUTCOME_MODEL_ENV = "AMFS_OUTCOME_MODEL"
 
@@ -301,6 +336,121 @@ def first_strike(outcome_type: OutcomeType | str, success_count: int, failure_co
     )
 
 
+def verification_weight(verified: bool) -> float:
+    """:data:`VERIFIED_EVIDENCE_WEIGHT` for an outcome decided outside the
+    agent, 1 for the agent's own declaration."""
+    return VERIFIED_EVIDENCE_WEIGHT if verified else 1.0
+
+
+def outcome_verified_by(record: Any) -> str | None:
+    """Who decided the outcome, when it was not the agent: the ``verified_by``
+    the SDK carries as a session attribute (``session_metadata.attributes``)
+    or, on an older record, at the top of the metadata. ``None`` for an
+    agent-declared outcome."""
+    meta = getattr(record, "session_metadata", None)
+    if not isinstance(meta, dict):
+        return None
+    value = meta.get("verified_by")
+    if not value:
+        attrs = meta.get("attributes")
+        value = attrs.get("verified_by") if isinstance(attrs, dict) else None
+    if isinstance(value, str) and value.strip():
+        return value.strip().lower()
+    return None
+
+
+def uplift_from_counts(
+    read_successes: int, read_total: int, unread_successes: int, unread_total: int
+) -> tuple[float | None, int]:
+    """An entry's uplift from the entity's recent sessions: the success rate of
+    the sessions that read it minus that of the sessions that did not, and the
+    sample size the credit is shrunk by (the smaller side). ``(None, 0)`` when
+    either side is empty — one-sided data is not a comparison."""
+    if read_total <= 0 or unread_total <= 0:
+        return None, 0
+    uplift = read_successes / read_total - unread_successes / unread_total
+    return max(-1.0, min(1.0, uplift)), min(int(read_total), int(unread_total))
+
+
+def outcome_read_keys(record: Any) -> set[str]:
+    """Every entry spec a session read: the terminal outcome's causal keys and
+    the failed attempts'. An episode that read a rule, failed on it and
+    resolved without it still had the rule in front of it."""
+    keys = {str(k) for k in (getattr(record, "causal_entry_keys", None) or ())}
+    for attempt in getattr(record, "attempts", None) or ():
+        keys.update(str(k) for k in (getattr(attempt, "causal_entry_keys", None) or ()))
+    return keys
+
+
+def uplift_counts(
+    records: Iterable[Any],
+    entity_path: str,
+    keys: Iterable[str],
+    *,
+    now: datetime | None = None,
+) -> dict[str, tuple[float | None, int]]:
+    """Each key's ``(uplift, sessions)`` over the entity's recent outcomes —
+    the reference definition an adapter that keeps outcomes maintains in
+    ``MemoryEntry.uplift`` (the Postgres adapter renders it to SQL).
+
+    The sample is the newest ``UPLIFT_WINDOW`` known outcomes about the entity
+    (``entity_paths`` names it, or a cited key is under it) from the last
+    ``UPLIFT_WINDOW_DAYS``. A session *read* a key when any of its steps
+    cited it (:func:`outcome_read_keys`); success is :func:`is_success`.
+    """
+    now = now or datetime.now(UTC)
+    since = now - timedelta(days=UPLIFT_WINDOW_DAYS)
+    prefix = entity_path.rstrip("/") + "/"
+    sample: list[tuple[datetime, bool, set[str]]] = []
+    for record in records:
+        outcome_type = getattr(record, "outcome_type", None)
+        outcome_type = getattr(outcome_type, "value", outcome_type)
+        if not is_known(outcome_type):
+            continue
+        at = getattr(record, "committed_at", None)
+        if at is None or at < since:
+            continue
+        read = outcome_read_keys(record)
+        paths = set(getattr(record, "entity_paths", None) or ())
+        if entity_path not in paths and not any(k.startswith(prefix) for k in read):
+            continue
+        sample.append((at, is_success(outcome_type), read))
+    sample.sort(key=lambda row: row[0], reverse=True)
+    sample = sample[:UPLIFT_WINDOW]
+    out: dict[str, tuple[float | None, int]] = {}
+    for key in keys:
+        spec = prefix + key
+        read_n = read_s = unread_n = unread_s = 0
+        for _at, ok, read in sample:
+            if spec in read:
+                read_n += 1
+                read_s += int(ok)
+            else:
+                unread_n += 1
+                unread_s += int(ok)
+        out[key] = uplift_from_counts(read_s, read_n, unread_s, unread_n)
+    return out
+
+
+def uplift_credit(uplift: float | None, sessions: int, *, success: bool) -> float:
+    """The entry's share of a split, in ``[UPLIFT_FLOOR, 1]``.
+
+    Full share for a success on an entry with non-negative uplift and for a
+    failure on one with non-positive uplift — the outcome went the way the
+    entry's record says it goes. Otherwise the share falls with the uplift's
+    size, shrunk toward 1 while the sample is small and never below the
+    floor. No measurement (``uplift`` unset or no sessions) is the uniform
+    split the model always had.
+    """
+    if uplift is None or sessions <= 0:
+        return 1.0
+    signed = uplift if success else -uplift
+    if signed >= 0:
+        return 1.0
+    shrink = sessions / (sessions + UPLIFT_SHRINK)
+    return max(UPLIFT_FLOOR, min(1.0, 1.0 + shrink * signed))
+
+
 def evidence_weight(
     outcome_type: OutcomeType | str,
     *,
@@ -309,14 +459,25 @@ def evidence_weight(
     n_causal: int = 1,
     success_count: int = 0,
     failure_count: int = 0,
+    credit: float = 1.0,
+    verified: bool = False,
 ) -> float:
-    """The evidence mass one outcome adds to one of its causal entries."""
+    """The evidence mass one outcome adds to one of its causal entries.
+
+    *credit* is the entry's uplift share (:func:`uplift_credit`); *verified*
+    says the outcome was decided outside the agent (:func:`verification_weight`).
+    Both default to the uniform, agent-declared weight the model always had.
+    """
     target = 1.0 if is_success(outcome_type) else 0.0
     surprise = 1.0 + abs(target - clamp_confidence(current_confidence))
     if first_strike(outcome_type, success_count, failure_count):
         surprise = 1.0
     share = 1.0 / max(1, n_causal)
-    return severity(outcome_type) * max(0.0, causal_confidence) * share * surprise
+    return (
+        severity(outcome_type) * max(0.0, causal_confidence)
+        * max(UPLIFT_FLOOR, min(1.0, credit)) * share * surprise
+        * verification_weight(verified)
+    )
 
 
 def posterior(prior: float, evidence_success: float, evidence_failure: float) -> float:
@@ -333,6 +494,7 @@ def apply_outcome(
     causal_confidence: float = 1.0,
     n_causal: int = 1,
     was_discredited: bool | None = None,
+    verified: bool = False,
 ) -> EvidenceUpdate:
     """Compute the evidence update one outcome makes to ``entry``.
 
@@ -340,10 +502,13 @@ def apply_outcome(
     when set, otherwise the entry's current confidence becomes the prior (the
     first outcome an entry ever sees). ``was_discredited`` defaults to
     ``entry.discredited_at is not None``; an entry stays discredited until
-    evidence lifts the posterior back over the threshold.
+    evidence lifts the posterior back over the threshold. The entry's share
+    of the split is read off its ``uplift`` (:func:`uplift_credit`);
+    *verified* is whether the outcome was decided outside the agent.
     """
     prior = entry.prior_confidence if entry.prior_confidence is not None else entry.confidence
     prior = clamp_confidence(prior)
+    success = is_success(outcome_type)
     w = evidence_weight(
         outcome_type,
         current_confidence=entry.confidence,
@@ -351,8 +516,12 @@ def apply_outcome(
         n_causal=n_causal,
         success_count=entry.success_count,
         failure_count=entry.failure_count,
+        credit=uplift_credit(
+            getattr(entry, "uplift", None), int(getattr(entry, "uplift_sessions", 0) or 0),
+            success=success,
+        ),
+        verified=verified,
     )
-    success = is_success(outcome_type)
     e_s = entry.evidence_success * EVIDENCE_DECAY + (w if success else 0.0)
     e_f = entry.evidence_failure * EVIDENCE_DECAY + (0.0 if success else w)
     new_conf = posterior(prior, e_s, e_f)
@@ -632,6 +801,7 @@ def apply_record_to_entry(
     model = model or outcome_model()
     updates: list[EvidenceUpdate] = []
     current = entry
+    verified = outcome_verified_by(record) is not None
     for outcome_type, keys, versions in outcome_steps_with_versions(record):
         if entry.entry_key not in keys:
             continue
@@ -649,6 +819,7 @@ def apply_record_to_entry(
                 outcome_type,
                 causal_confidence=record.causal_confidence,
                 n_causal=len(keys),
+                verified=verified,
             )
         fields = upd.as_entry_update(now)
         if upd.discredited and current.discredited_at is not None:
@@ -933,6 +1104,17 @@ __all__ = [
     "DISCREDIT_THRESHOLD",
     "EVIDENCE_DECAY",
     "PRIOR_STRENGTH",
+    "UPLIFT_FLOOR",
+    "UPLIFT_SHRINK",
+    "UPLIFT_WINDOW",
+    "UPLIFT_WINDOW_DAYS",
+    "VERIFIED_EVIDENCE_WEIGHT",
+    "outcome_read_keys",
+    "outcome_verified_by",
+    "uplift_counts",
+    "uplift_credit",
+    "uplift_from_counts",
+    "verification_weight",
     "REPLAY_DELIVERY_ATTRIBUTE",
     "REPLAY_ORIGINS",
     "SEVERITY",

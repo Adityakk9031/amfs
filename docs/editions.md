@@ -129,6 +129,9 @@ AMFS is GitHub for agent memory, split into two layers. The open-source core giv
 | Action priors on retrieve — `include_priors` + `candidate_actions` return per-action won/lost here and a recommendation (`act` / `explore` / `escalate`; `explore` assigned per agent) | Yes | Yes |
 | Failed attempts inside one trace (`record_attempt`) — the entries read before the failure are charged, the recovery is credited, a `lesson-contrast-*` entry names both | Yes | Yes |
 | Reuse ledger — what memory was read back, by whom, and whether it was written by another agent (`GET /api/v1/reuse`, `writer=` filter) | Yes | Yes |
+| Verified outcomes weigh more — `verified_by` on `commit_outcome` (CI, a monitor, a reviewer) multiplies the evidence by 1.5 over the agent's own declaration; the same constant in Python and SQL | Yes | Yes |
+| Credit by uplift — each cited entry's share of an outcome follows whether the entity's recent sessions that read it fared better than the ones that did not; shrunk while the sample is small, floored at 0.25 (Postgres; the filesystem adapter keeps the uniform split) | Yes | Yes |
+| The number — success over sessions per agent, in episodes, with sessions-to-recover after each regime shift and the share of outcomes verified externally (`GET /api/v1/learning`) | Yes | Yes |
 | Byte-faithful capture of model exchanges as sealed traces (OpenRouter proxy `AMFS_PROXY_CAPTURE`; default off, opt-in per account on the hosted gateway) | Yes | Yes |
 | LLM importance scoring (3-dimension) | — | Yes |
 | Background tier recomputation (`TierWorker`) | — | Yes |
@@ -265,7 +268,7 @@ Every public sentence about the loop sits on a rung of one ladder. A rung is pub
 
 | Rung | Sentence | Evidence | Status |
 |:--|:--|:--|:--|
-| 1 | Agents that stop repeating mistakes: every outcome moves the evidence behind what the agent relied on, and the next run gets a recommendation instead of a guess. | The evidence arithmetic and `recommend()` in OSS `amfs_core`; level-0 results in the RSI paper. | Published |
+| 1 | Agents that stop repeating mistakes: every outcome moves the evidence behind what the agent relied on, and the next run gets a recommendation instead of a guess. | The evidence arithmetic and `recommend()` in OSS `amfs_core`; level-0 results in the RSI paper. The per-agent curve (`GET /api/v1/learning`) is how the sentence is checked on a deployment: first-window rate, latest-window rate, sessions to recover after a shift, and how much of it was verified outside the agent. | Published |
 | 2 | A self-improvement loop for AI agents, gated by held-out outcomes, reversible, audited, preregistered. | Tier 1–3 of the repair loop live in production with the gate benchmark scorecard (false-accept and true-reject rates on injected wrong fixes). | Mechanism shipped; scorecard read on dev, production readings pending |
 | 3 | Level 1 adds to level 0. | A confirmatory re-run on a single preregistered primary endpoint, positive at the preregistered alpha. | Not claimed |
 | 4 | Each cycle improves faster than the last. | An ignition series over two or more cycles, regressions reported per family. | Not claimed |
