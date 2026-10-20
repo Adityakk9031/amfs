@@ -4086,18 +4086,22 @@ class PostgresAdapter(AdapterABC):
                      ORDER BY committed_at DESC, id DESC
                      LIMIT %s"""
         with self._pool.connection() as conn, conn.cursor() as cur:
+            # One row past the cap tells "exactly the cap" from "more than
+            # it"; a window holding exactly ``limit`` outcomes is complete.
             cur.execute(
                 f"""WITH win AS ({newest})
                     SELECT committed_at AS at, outcome_type, agent_id, {verified}
                     FROM amfs_outcomes
                     WHERE id IN (SELECT id FROM win)
                     ORDER BY committed_at ASC, id ASC""",
-                (*params, cap),
+                (*params, cap + 1),
             )
             sessions = [dict(row) for row in cur.fetchall()]
             if not sessions:
                 return empty
-            truncated = len(sessions) >= cap
+            truncated = len(sessions) > cap
+            if truncated:
+                del sessions[0]
             # A shift before the oldest session kept has no "before" in this
             # series; bound the shifts by what the sessions actually cover.
             shift_since = max(since, sessions[0]["at"]) if truncated else since

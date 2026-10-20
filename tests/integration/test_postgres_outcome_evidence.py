@@ -428,6 +428,11 @@ def test_learning_series_keeps_the_newest_sessions_under_the_cap(adapter, monkey
     assert capped["truncated"] is True
     # The discredit of ``early`` happened before the oldest session kept.
     assert capped["shifts"] == []
+    # Exactly the cap is a complete series: nothing dropped, the shift kept.
+    exact = adapter.learning_series(since=since, limit=8)
+    assert len(exact["sessions"]) == 8
+    assert exact["truncated"] is False
+    assert [s["key"] for s in exact["shifts"]] == ["early"]
 
 
 def test_learning_series_counts_entries_cited_only_in_failed_attempts(adapter, monkeypatch) -> None:
