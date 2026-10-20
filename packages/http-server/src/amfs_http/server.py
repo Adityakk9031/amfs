@@ -5972,6 +5972,59 @@ def reuse_summary(
     }
 
 
+@app.get("/api/v1/learning")
+def learning_curve_endpoint(
+    request: Request,
+    days: int = 90,
+    agent: str | None = None,
+    entity_path: str | None = None,
+    window: int = 10,
+    episodes: int = 12,
+    _auth: str | None = Depends(verify_api_key),
+) -> dict[str, Any]:
+    """The number: success over sessions, and recovery after regime shifts.
+
+    ``amfs_core.learning.learning_curve`` over the outcomes in the window —
+    the agent's sessions in order, cut into ``episodes`` bins, with the first
+    and latest ``window`` sessions as the headline, and for every entry the
+    agent relied on that was discredited in the window, how many sessions it
+    took the rolling rate to get back to where it was. ``verified_share`` says
+    how much of the curve was decided outside the agent.
+
+    Scoped to the agents the caller may see, like ``/reuse``; ``agent`` and
+    ``entity_path`` narrow on top of that. ``days`` is clamped so a
+    hand-written URL cannot ask for an unbounded scan, and the series is the
+    newest 5000 sessions in the window: ``truncated`` says when there were
+    more, and ``span.from`` where the curve actually starts.
+    """
+    from amfs_core.learning import MAX_EPISODES, learning_curve
+
+    days = max(1, min(int(days or 90), 365))
+    window = max(3, min(int(window or 10), 100))
+    episodes = max(1, min(int(episodes or 12), MAX_EPISODES))
+    since = datetime.now(UTC) - timedelta(days=days)
+    head = {
+        "since": since.isoformat(),
+        "days": days,
+        "agent": agent or None,
+        "entity_path": entity_path or None,
+    }
+    adapter = _get_memory()._adapter
+    series = getattr(adapter, "learning_series", None)
+    if series is None:
+        return {**head, "available": False, "reason": "the learning curve needs the Postgres adapter"}
+    data = series(
+        since=since,
+        agent=agent or None,
+        entity_path=entity_path or None,
+        visible_agents=_visible_agent_ids(request),
+    )
+    curve = learning_curve(
+        data.get("sessions") or [], shifts=data.get("shifts") or [], window=window, episodes=episodes
+    )
+    return {**head, "available": True, "truncated": bool(data.get("truncated")), **curve}
+
+
 @app.get("/api/v1/agents/{agent_id:path}/memory-graph")
 def agent_memory_graph(
     request: Request,

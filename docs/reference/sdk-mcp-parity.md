@@ -29,7 +29,8 @@ AMFS exposes memory three ways: the **MCP server** (for agents), the **Python SD
 | List | `amfs_list` / `amfs_my_entries` | `list` / `my_entries` | `list`, `listAsync` / `myEntries` |
 | Search (filters) | `amfs_search` | `search` | `search`, `searchAsync` |
 | Semantic retrieve | `amfs_retrieve` | `retrieve` | `retrieveAsync` |
-| Briefing (Cortex) | `amfs_briefing` | `briefing` | `briefingAsync` |
+| Action priors and recommendation on retrieve | `amfs_retrieve(include_priors=, candidate_actions=, situation=, compact=)` | `retrieve(include_priors=, candidate_actions=, situation=, compact=, abstain=)` | — (HTTP `POST /api/v1/retrieve` with `include_priors`, `candidate_actions` in the body) |
+| Briefing (Cortex) | `amfs_briefing(compact=, since=)` | `briefing(compact=, since=)` | `briefingAsync({compact, since})` |
 | Cross-agent read | `amfs_read_from` | `read_from` | `readFrom` |
 | History | `amfs_history` | `history` | `history`, `historyAsync` |
 | Stats | `amfs_stats` | `stats` | `stats`, `statsAsync` |
@@ -44,6 +45,10 @@ AMFS exposes memory three ways: the **MCP server** (for agents), the **Python SD
 | Commit outcome | `amfs_commit_outcome` | `commit_outcome` | `commitOutcome`, `commitOutcomeAsync` |
 | Record context | `amfs_record_context` | `record_context` | `recordContext` |
 | Record action | `amfs_record_action` | `record_action` | `recordAction` (tracker) |
+| Mark a failed attempt before trying another | `amfs_record_attempt` | `record_attempt` | — |
+| Reuse over a window (what was read back, by whom, written by whom) | — | — (HTTP `GET /api/v1/reuse?days=&agent=&writer=`) | — (same endpoint through the `HttpAdapter`) |
+| Verified outcome (weighs 1.5× the agent's own word) | `amfs_commit_outcome(verified_by=)` | `commit_outcome(verified_by=)` | `commitOutcome(ref, type, { attributes: { verified_by } })` |
+| Learning curve: success over sessions, recovery after shifts, verified share | — | — (HTTP `GET /api/v1/learning?days=&agent=&entity_path=&window=&episodes=`) | — (same endpoint through the `HttpAdapter`) |
 | Explain session | `amfs_explain` | `explain` | `explain` |
 | Timeline | `amfs_timeline` | `timeline` | `timelineAsync` |
 | List traces | `amfs_list_traces` | `list_traces` (cursor / since / until) | `listTracesAsync`, `listTracesPageAsync` (`{traces, nextCursor, hasMore}`) |
@@ -160,7 +165,8 @@ These MCP tools are **not** mirrored 1:1 in the SDKs, by design. They are either
 | MCP tool | Status | Rationale |
 |:--|:--|:--|
 | `amfs_consolidate`, `amfs_consolidation_status/proposals/candidates` | Pro (HTTP-proxied) | Backed by the Cortex consolidation API, not the OSS adapter ABC. The TypeScript `HttpAdapter` exposes `consolidation*Async` passthroughs; the Python SDK reaches them via the HTTP API directly. See the caveat below. |
-| `amfs_export_training_data` | Pro (HTTP-proxied) | Calls `GET /api/v1/pro/export`. Exposed on the TS `HttpAdapter` as `exportTrainingDataAsync`; Python calls the endpoint directly. |
+| `amfs_export_training_data` | Pro (HTTP-proxied) | Calls `GET /api/v1/pro/export` (`format=sft\|dpo\|team_sft`). Exposed on the TS `HttpAdapter` as `exportTrainingDataAsync`; Python calls the endpoint directly. The export is account-wide, so it is taken by an account admin on the dashboard or by an API key an admin created; a developer's or user's key is refused with 403. |
+| Managed models (weight loop) | Pro (hosted only) | `POST /api/v1/models/{id}/train` (`method: sft\|preference`), `GET /api/v1/models/{id}/training-estimate`, `POST /api/v1/models/{id}/versions/{vid}/promote`; the promoted version answers on the gateway `/api/v1/chat/completions` under its `public_model_id`. Training reads the account's sealed traces (the capture rows above) and passes an eval gate before promotion. No MCP tool and no SDK methods; the dashboard's Models page and the routes are the surface. |
 | `amfs_record_span`, `amfs_start_span`, `amfs_end_span`, `amfs_set_trace_attributes`, `amfs_record_llm_call` | Pro (works locally and over HTTP) | Spans live on the Pro `ImmutableDecisionTrace`; the OSS `DecisionTrace` carries them only as `session_metadata` extras that the seal path lifts out. The Python side is `amfs_pro.tracing` (`trace_session`, `span`, `traced`, `record_llm_call`, `instrument_*`) in the private `amfs-sdk-pro` dist; OSS `AgentMemory` has only the generic `set_session_attributes` / `record_llm_call` / `commit_outcome(attributes=...)`. The TS SDK has `setSessionAttributes`, `recordLlmCall` and `instrumentOpenAI` / `instrumentAnthropic` but no span recorder. |
 | `amfs_trace_search`, `amfs_trace_spans`, `amfs_span_payload`, `amfs_trace_compare` | Pro (HTTP-proxied, local fallback) | Backed by the Pro traces API (`/api/v1/pro/traces/search`, `/{id}/spans`, `/{id}/spans/{span_id}`, `/compare`). The local fallback has no semantic search or paging and can only see traces the adapter persists plus the last one committed in-process. No SDK methods yet; call the endpoints through the `HttpAdapter`. |
 | `amfs_judge_trace`, `amfs_judge_define`, `amfs_judges`, `amfs_seed_starter_judges`, `amfs_verdicts`, `amfs_eval_summary`, `amfs_backfill`, `amfs_behaviors`, `amfs_behavior_define`, `amfs_behavior_from_trace`, `amfs_blast_radius`, `amfs_incident`, `amfs_segment`, `amfs_dimensions`, `amfs_attribute_failure`, `amfs_propose_fix`, `amfs_fixes`, `amfs_approve_fix_memory`, `amfs_investigate`, `amfs_alerts` | Pro (HTTP-proxied, **no local mode**) | Agent evaluation runs on the hosted `/api/v1/eval` service (LLM judges, budgets, behavior mining). Without `AMFS_HTTP_URL` the tools answer `{"mode": "local"}` and do nothing. The OSS SDKs have no methods for these; use the private `amfs_pro` client or the `amfs-pro` CLI (see *Agent evaluation* above). |

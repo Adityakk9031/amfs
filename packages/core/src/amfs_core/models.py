@@ -444,6 +444,13 @@ class MemoryEntry(BaseModel):
     #: stronger signal than one agent's repeated success, and a peer reading the
     #: entry can see who stands behind it.
     validators: list[str] = Field(default_factory=list)
+    #: Credit by uplift (``amfs_core.evidence``): over the entity's recent
+    #: sessions, the success rate of those that read this entry minus that of
+    #: those that did not, and the sample it rests on (the smaller side).
+    #: Maintained by an adapter that keeps outcomes; unset means the entry
+    #: takes a uniform share of every outcome's credit.
+    uplift: float | None = None
+    uplift_sessions: int = 0
     recall_count: int = 0
     priority_score: float | None = None
     tier: int = 3

@@ -4,10 +4,14 @@
 Random outcome sequences — every known type, causal
 confidence over its range, one to three cited keys with the credit split,
 failed attempts before the terminal outcome, two agents for the validator
-list — are applied through the adapter (the trigger) and through the Python
-model, and the two records must agree on every evidence field after every
-step. The seeds are fixed so a disagreement is reproducible by seed; raise
-``AMFS_PARITY_CASES`` to run more.
+list, a ``verified_by`` on some outcomes for the verification factor — are
+applied through the adapter (the trigger) and through the Python model, and
+the two records must agree on every evidence field after every step. Credit
+by uplift is checked both ways: the uplift the trigger refreshed on each
+cited row must equal ``amfs_core.evidence.uplift_counts`` over the same
+outcomes, and the Python model is then handed that uplift for the next step,
+as the adapter's own rows carry it. The seeds are fixed so a disagreement is
+reproducible by seed; raise ``AMFS_PARITY_CASES`` to run more.
 
 Requires a running Postgres instance. Set AMFS_TEST_PG_DSN to enable.
 """
@@ -73,6 +77,7 @@ def _random_record(rng: random.Random) -> OutcomeRecord:
                 causal_entry_keys=[f"svc/mod/{k}" for k in rng.sample(KEYS, k=rng.randint(1, 2))],
             )
         )
+    verified_by = rng.choice((None, None, "ci", "monitor:latency", "reviewer"))
     return OutcomeRecord(
         outcome_ref=f"t-{uuid.uuid4().hex[:6]}",
         outcome_type=rng.choice(TYPES),
@@ -81,7 +86,13 @@ def _random_record(rng: random.Random) -> OutcomeRecord:
         causal_entry_keys=[f"svc/mod/{k}" for k in cited],
         agent_id=rng.choice(("agent-1", "agent-2")),
         attempts=attempts,
+        session_metadata={"attributes": {"verified_by": verified_by}} if verified_by else {},
     )
+
+
+def _with_uplift(entry: MemoryEntry, got: MemoryEntry) -> MemoryEntry:
+    """The Python model reads credit off the entry; the adapter maintains it."""
+    return entry.model_copy(update={"uplift": got.uplift, "uplift_sessions": got.uplift_sessions})
 
 
 def _assert_same(got: MemoryEntry, want: MemoryEntry, *, seed: int, step: int, key: str) -> None:
@@ -107,14 +118,29 @@ def test_sql_and_python_agree_on_random_outcome_sequences(adapter, monkeypatch, 
     want: dict[str, MemoryEntry] = {}
     for key in KEYS:
         want[key] = adapter.write(_entry(key, round(rng.uniform(0.05, 0.95), 3)))
+    history: list[OutcomeRecord] = []
     for step in range(STEPS):
         record = _random_record(rng)
         adapter.commit_outcome(record)
+        history.append(record)
+        cited = {k for _ep, k in ev.cited_entries(record)}
+        reference = ev.uplift_counts(history, "svc/mod", KEYS)
         for key in KEYS:
             want[key], _ = ev.apply_record_to_entry(want[key], record, model="evidence")
             got = adapter.read("svc/mod", key)
             assert got is not None
             _assert_same(got, want[key], seed=seed, step=step, key=key)
+            if key in cited:
+                # The trigger refreshed this row's uplift from the window that
+                # now includes the outcome just committed.
+                uplift, sessions = reference[key]
+                where = f"seed={seed} step={step} key={key}"
+                assert got.uplift_sessions == sessions, where
+                if uplift is None:
+                    assert got.uplift is None, where
+                else:
+                    assert got.uplift == pytest.approx(uplift, abs=1e-9), where
+            want[key] = _with_uplift(want[key], got)
 
 
 def test_multiplicative_model_agrees_too(adapter, monkeypatch) -> None:
@@ -129,6 +155,7 @@ def test_multiplicative_model_agrees_too(adapter, monkeypatch) -> None:
         for key in KEYS:
             want[key], _ = ev.apply_record_to_entry(want[key], record, model="multiplicative")
             got = adapter.read("svc/mod", key)
+            want[key] = _with_uplift(want[key], got)
             assert got.confidence == pytest.approx(want[key].confidence, abs=TOL), (step, key)
             assert (got.success_count, got.failure_count) == (
                 want[key].success_count,

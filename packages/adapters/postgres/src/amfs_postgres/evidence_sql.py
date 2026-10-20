@@ -18,6 +18,14 @@ The arithmetic stays in the database rather than moving to the app layer
 because the trigger is what makes an outcome's effect atomic with its row,
 across every writer (SDK, HTTP server, MCP) and every language — the
 alternative is a second write path per client that can race the first.
+
+The rendering also carries the two factors the weight gained after 009:
+*verification* (``verified_by`` on the outcome row; ``VERIFIED_EVIDENCE_WEIGHT``)
+and *credit by uplift* (``uplift`` / ``uplift_sessions`` on the entry, refreshed
+for the cited keys after each outcome from the entity's recent outcomes;
+``UPLIFT_*``). Both change the step's signature, so this file now defines the
+trigger too: the 009 trigger called the eight-argument step and would keep
+calling it.
 """
 
 from __future__ import annotations
@@ -67,9 +75,23 @@ def render_evidence_sql() -> str:
 -- read off the Python model: SUCCESS_TYPES, SEVERITY, OUTCOME_MULTIPLIERS,
 -- EVIDENCE_DECAY = {_num(ev.EVIDENCE_DECAY)}, PRIOR_STRENGTH = {_num(ev.PRIOR_STRENGTH)},
 -- DISCREDIT_THRESHOLD = {_num(ev.DISCREDIT_THRESHOLD)},
--- FIRST_STRIKE_MIN_WINS = {ev.FIRST_STRIKE_MIN_WINS}, MAX_VALIDATORS = {ev.MAX_VALIDATORS}.
--- The row-copy shape (007), the credited
--- claim rule (versions) and the trigger (009) are unchanged.
+-- FIRST_STRIKE_MIN_WINS = {ev.FIRST_STRIKE_MIN_WINS}, MAX_VALIDATORS = {ev.MAX_VALIDATORS},
+-- and the two factors the weight gained since:
+--   verification  VERIFIED_EVIDENCE_WEIGHT = {_num(ev.VERIFIED_EVIDENCE_WEIGHT)} for an outcome
+--                 decided outside the agent (amfs_outcomes.verified_by set);
+--   credit        UPLIFT_WINDOW = {ev.UPLIFT_WINDOW}, UPLIFT_WINDOW_DAYS = {ev.UPLIFT_WINDOW_DAYS},
+--                 UPLIFT_SHRINK = {ev.UPLIFT_SHRINK}, UPLIFT_FLOOR = {_num(ev.UPLIFT_FLOOR)}: the
+--                 entry's share of the split, from how much more often the
+--                 entity's recent sessions that read it succeeded than the
+--                 ones that did not (amfs_memory_entries.uplift, refreshed
+--                 for the cited keys after each outcome).
+-- The row-copy shape (007) and the credited claim rule (versions) are
+-- unchanged. The step takes a ninth argument and the trigger passes it, so
+-- the 009 trigger is redefined here; the eight-argument step is retired.
+
+ALTER TABLE amfs_outcomes ADD COLUMN IF NOT EXISTS verified_by TEXT;
+ALTER TABLE amfs_memory_entries ADD COLUMN IF NOT EXISTS uplift DOUBLE PRECISION;
+ALTER TABLE amfs_memory_entries ADD COLUMN IF NOT EXISTS uplift_sessions INTEGER NOT NULL DEFAULT 0;
 
 CREATE OR REPLACE FUNCTION amfs_outcome_is_success(t TEXT) RETURNS BOOLEAN AS $$
     SELECT t IN ({_sql_list(success_types)});
@@ -92,6 +114,118 @@ CREATE OR REPLACE FUNCTION amfs_outcome_multiplier(t TEXT) RETURNS NUMERIC AS $$
     END;
 $$ LANGUAGE sql IMMUTABLE;
 
+-- amfs_core.evidence.uplift_credit: the entry's share of a split, in
+-- [UPLIFT_FLOOR, 1]. Full share when the outcome went the way the entry's
+-- record says it goes; otherwise it falls with the uplift's size, shrunk
+-- toward 1 while the sample is small. Computed in double precision, as the
+-- Python model computes it, and handed to the NUMERIC weight.
+CREATE OR REPLACE FUNCTION amfs_uplift_credit(
+    uplift DOUBLE PRECISION, sessions INTEGER, success BOOLEAN
+) RETURNS NUMERIC AS $$
+    SELECT CASE
+        WHEN uplift IS NULL OR COALESCE(sessions, 0) <= 0 THEN 1.0
+        WHEN (CASE WHEN success THEN uplift ELSE -uplift END) >= 0 THEN 1.0
+        ELSE GREATEST({_num(ev.UPLIFT_FLOOR)}, LEAST(1.0, (
+            1.0 + (sessions::DOUBLE PRECISION / (sessions + {ev.UPLIFT_SHRINK}))
+                * (CASE WHEN success THEN uplift ELSE -uplift END)
+        )::NUMERIC))
+    END;
+$$ LANGUAGE sql IMMUTABLE;
+
+-- amfs_core.evidence.uplift_counts: refresh uplift / uplift_sessions on the
+-- current row of each cited key from the entity's newest UPLIFT_WINDOW known
+-- outcomes of the last UPLIFT_WINDOW_DAYS. A session read a key when any of
+-- its steps cited it (terminal keys or a failed attempt's). Only the cited
+-- keys are refreshed: credit is read at citation time, so an entry no outcome
+-- cites has no use for it, and the refresh costs one window per entity
+-- rather than one per entry on it.
+CREATE OR REPLACE FUNCTION amfs_refresh_uplift(
+    p_namespace TEXT,
+    p_account UUID,
+    p_keys TEXT[]
+) RETURNS INTEGER AS $$
+DECLARE
+    keys TEXT[];
+    entry_key TEXT;
+    ep TEXT;
+    k TEXT;
+    paths TEXT[];
+    read_n INTEGER;
+    read_s INTEGER;
+    unread_n INTEGER;
+    unread_s INTEGER;
+    touched INTEGER := 0;
+    c_window CONSTANT INTEGER := {ev.UPLIFT_WINDOW};
+    c_window_days CONSTANT INTEGER := {ev.UPLIFT_WINDOW_DAYS};
+BEGIN
+    SELECT COALESCE(array_agg(DISTINCT x), '{{}}') INTO keys
+    FROM unnest(COALESCE(p_keys, '{{}}')) AS x
+    WHERE position('/' in x) > 0;
+    IF cardinality(keys) = 0 THEN
+        RETURN 0;
+    END IF;
+    SELECT COALESCE(array_agg(DISTINCT left(x, length(x) - length(substring(x from '([^/]+)$')) - 1)), '{{}}')
+    INTO paths FROM unnest(keys) AS x;
+
+    FOREACH ep IN ARRAY paths
+    LOOP
+        CREATE TEMP TABLE IF NOT EXISTS amfs_uplift_window (
+            ok BOOLEAN, read_keys TEXT[]
+        ) ON COMMIT DROP;
+        TRUNCATE amfs_uplift_window;
+        INSERT INTO amfs_uplift_window (ok, read_keys)
+        SELECT amfs_outcome_is_success(o.outcome_type),
+               (SELECT COALESCE(array_agg(DISTINCT x), '{{}}') FROM (
+                    SELECT unnest(COALESCE(o.causal_entry_keys, '{{}}')) AS x
+                    UNION ALL
+                    SELECT jsonb_array_elements_text(COALESCE(a->'causal_entry_keys', '[]'::jsonb))
+                    FROM jsonb_array_elements(COALESCE(o.attempts, '[]'::jsonb)) AS a
+                ) s)
+        FROM amfs_outcomes o
+        WHERE o.namespace = p_namespace
+          AND o.account_id IS NOT DISTINCT FROM p_account
+          AND o.entity_paths @> ARRAY[ep]
+          AND o.committed_at >= NOW() - make_interval(days => c_window_days)
+          AND amfs_outcome_is_known(o.outcome_type)
+        ORDER BY o.committed_at DESC, o.id DESC
+        LIMIT c_window;
+
+        FOREACH entry_key IN ARRAY keys
+        LOOP
+            k := substring(entry_key from '([^/]+)$');
+            IF left(entry_key, length(entry_key) - length(k) - 1) <> ep THEN
+                CONTINUE;
+            END IF;
+            SELECT COUNT(*) FILTER (WHERE entry_key = ANY(read_keys)),
+                   COUNT(*) FILTER (WHERE entry_key = ANY(read_keys) AND ok),
+                   COUNT(*) FILTER (WHERE NOT (entry_key = ANY(read_keys))),
+                   COUNT(*) FILTER (WHERE NOT (entry_key = ANY(read_keys)) AND ok)
+            INTO read_n, read_s, unread_n, unread_s
+            FROM amfs_uplift_window;
+
+            UPDATE amfs_memory_entries
+            SET uplift = CASE WHEN read_n > 0 AND unread_n > 0
+                    THEN read_s::DOUBLE PRECISION / read_n - unread_s::DOUBLE PRECISION / unread_n
+                    ELSE NULL END,
+                uplift_sessions = CASE WHEN read_n > 0 AND unread_n > 0
+                    THEN LEAST(read_n, unread_n) ELSE 0 END
+            WHERE namespace = p_namespace
+              AND entity_path = ep
+              AND key = k
+              AND superseded_at IS NULL
+              AND account_id IS NOT DISTINCT FROM p_account;
+            touched := touched + 1;
+        END LOOP;
+    END LOOP;
+    RETURN touched;
+END;
+$$ LANGUAGE plpgsql;
+
+-- The eight-argument step (009) is retired: with two overloads the trigger's
+-- call would be ambiguous to a reader and the old one would silently keep
+-- the uniform, unverified weight.
+DROP FUNCTION IF EXISTS amfs_apply_outcome_step(TEXT, UUID, TEXT[], TEXT, NUMERIC, TEXT, JSONB, TEXT);
+
 CREATE OR REPLACE FUNCTION amfs_apply_outcome_step(
     p_namespace TEXT,
     p_account UUID,
@@ -100,7 +234,8 @@ CREATE OR REPLACE FUNCTION amfs_apply_outcome_step(
     p_causal_confidence NUMERIC,
     p_model TEXT,
     p_versions JSONB,
-    p_agent TEXT
+    p_agent TEXT,
+    p_verified BOOLEAN
 ) RETURNS INTEGER AS $$
 DECLARE
     keys TEXT[];
@@ -128,6 +263,7 @@ DECLARE
     c_discredit CONSTANT NUMERIC := {_num(ev.DISCREDIT_THRESHOLD)};
     c_first_strike_wins CONSTANT INTEGER := {ev.FIRST_STRIKE_MIN_WINS};
     c_max_validators CONSTANT INTEGER := {ev.MAX_VALIDATORS};
+    c_verified CONSTANT NUMERIC := {_num(ev.VERIFIED_EVIDENCE_WEIGHT)};
 BEGIN
     -- Distinct, well-formed specs only; a key cited twice is one citation.
     SELECT COALESCE(array_agg(DISTINCT x), '{{}}') INTO keys
@@ -197,10 +333,14 @@ BEGIN
                AND COALESCE(cur.success_count, 0) >= c_first_strike_wins THEN
                 surprise := 1.0;
             END IF;
+            -- severity * causal_confidence * credit / n_causal * surprise
+            -- * verification (amfs_core.evidence.evidence_weight).
             w := amfs_outcome_severity(p_outcome_type)
                  * GREATEST(0.0, p_causal_confidence)
+                 * amfs_uplift_credit(cur.uplift, cur.uplift_sessions, is_ok)
                  / n_keys
-                 * surprise;
+                 * surprise
+                 * CASE WHEN COALESCE(p_verified, FALSE) THEN c_verified ELSE 1.0 END;
             e_s := COALESCE(cur.evidence_success, 0) * c_decay + CASE WHEN is_ok THEN w ELSE 0 END;
             e_f := COALESCE(cur.evidence_failure, 0) * c_decay + CASE WHEN is_ok THEN 0 ELSE w END;
             new_conf := LEAST(1.0, GREATEST(0.0,
@@ -258,6 +398,65 @@ BEGIN
         touched := touched + 1;
     END LOOP;
     RETURN touched;
+END;
+$$ LANGUAGE plpgsql;
+
+-- The 009 trigger, calling the nine-argument step: verified_by on the outcome
+-- row is the verification flag, and after every step the cited keys' uplift
+-- is refreshed from a window that now includes this outcome. The step reads
+-- the uplift the row carried before it, so an outcome never grades its own
+-- credit.
+CREATE OR REPLACE FUNCTION amfs_propagate_outcome() RETURNS TRIGGER AS $$
+DECLARE
+    model TEXT;
+    att JSONB;
+    att_keys TEXT[];
+    all_keys TEXT[];
+    verified BOOLEAN;
+BEGIN
+    model := COALESCE(NULLIF(current_setting('amfs.outcome_model', true), ''), 'evidence');
+    verified := NULLIF(btrim(COALESCE(NEW.verified_by, '')), '') IS NOT NULL;
+    all_keys := COALESCE(NEW.causal_entry_keys, '{{}}');
+
+    -- Failed attempts first, oldest to newest: each hands its own failure to
+    -- the entries that attempt relied on.
+    FOR att IN
+        SELECT value FROM jsonb_array_elements(COALESCE(NEW.attempts, '[]'::jsonb))
+        ORDER BY COALESCE((value->>'attempt')::INTEGER, 0)
+    LOOP
+        SELECT COALESCE(array_agg(x), '{{}}') INTO att_keys
+        FROM jsonb_array_elements_text(COALESCE(att->'causal_entry_keys', '[]'::jsonb)) AS x;
+        all_keys := all_keys || att_keys;
+        PERFORM amfs_apply_outcome_step(
+            NEW.namespace, NEW.account_id, att_keys,
+            COALESCE(att->>'outcome_type', 'minor_failure'),
+            NEW.causal_confidence, model,
+            COALESCE(att->'causal_entry_versions', '{{}}'::jsonb),
+            NEW.agent_id, verified
+        );
+    END LOOP;
+
+    -- Then the terminal outcome to the entries the resolution relied on.
+    PERFORM amfs_apply_outcome_step(
+        NEW.namespace, NEW.account_id, NEW.causal_entry_keys,
+        NEW.outcome_type, NEW.causal_confidence, model,
+        COALESCE(NEW.causal_entry_versions, '{{}}'::jsonb),
+        NEW.agent_id, verified
+    );
+
+    PERFORM amfs_refresh_uplift(NEW.namespace, NEW.account_id, all_keys);
+
+    PERFORM pg_notify('amfs_outcome', json_build_object(
+        'namespace', NEW.namespace,
+        'outcome_ref', NEW.outcome_ref,
+        'outcome_type', NEW.outcome_type,
+        'agent_id', NEW.agent_id,
+        'causal_confidence', NEW.causal_confidence,
+        'verified_by', NEW.verified_by,
+        'attempts', jsonb_array_length(COALESCE(NEW.attempts, '[]'::jsonb))
+    )::TEXT);
+
+    RETURN NEW;
 END;
 $$ LANGUAGE plpgsql;
 """

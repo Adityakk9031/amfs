@@ -34,8 +34,8 @@ from amfs_core.exclusions import (
     AGENT_ID_NOT_EXCLUDED_SQL,
     ENTITY_PATH_NOT_EXCLUDED_SQL,
 )
-from amfs_core.actions import recorded_environment
-from amfs_core.evidence import cited_entries, outcome_model
+from amfs_core.actions import entity_paths_of, recorded_environment
+from amfs_core.evidence import cited_entries, outcome_model, outcome_read_keys, outcome_verified_by
 from amfs_core.models import (
     OUTCOME_MULTIPLIERS,
     Agent,
@@ -628,6 +628,11 @@ _EVIDENCE_COLUMNS: tuple[str, ...] = (
     "success_count", "failure_count", "evidence_success", "evidence_failure",
     "last_outcome", "last_outcome_at", "discredited_at", "prior_confidence",
 )
+#: Credit by uplift (migration 012): maintained by the trigger for the keys
+#: an outcome cites, read by ``amfs_core.evidence.uplift_credit``. Not
+#: persisted on write — a rewritten claim starts from the uniform split and
+#: earns its own measurement the next time a session cites it.
+_UPLIFT_COLUMNS: tuple[str, ...] = ("uplift", "uplift_sessions")
 _EVIDENCE_SELECT = ", outcome_count, " + ", ".join(_EVIDENCE_COLUMNS)
 
 #: The columns ``_row_to_entry`` reads, named so that entry-returning SELECTs
@@ -638,8 +643,8 @@ _EVIDENCE_SELECT = ", outcome_count, " + ", ".join(_EVIDENCE_COLUMNS)
 #: unscoped ``list()`` over a 20k-row namespace moved ~80 MB per call, and a
 #: dashboard page that fans out to several such calls took 20-35 s while the
 #: database sat at 1% CPU (2026-09-17). Every column here is created by
-#: schema.sql or ensured by ``_apply_migrations`` (including migration 008),
-#: so the projection is safe on any bootstrapped database.
+#: schema.sql or ensured by ``_apply_migrations`` (including migrations 008
+#: and 012), so the projection is safe on any bootstrapped database.
 _ENTRY_COLUMNS: tuple[str, ...] = (
     "id",
     "namespace",
@@ -666,6 +671,7 @@ _ENTRY_COLUMNS: tuple[str, ...] = (
     "branch",
     "is_artifact",
     *_EVIDENCE_COLUMNS,
+    *_UPLIFT_COLUMNS,
 )
 ENTRY_SELECT = ", ".join(_ENTRY_COLUMNS)
 #: For the window before ``_apply_migrations`` adds is_artifact; the decoder
@@ -812,6 +818,7 @@ class PostgresAdapter(AdapterABC):
         self._has_outcome_embedding_col = False
         self._has_outcome_env_col = False
         self._has_task_text_col = False
+        self._has_verified_by_col = False
         self._pgvector_version: tuple[int, ...] | None = None
         # When an embedder is provided, embeddings are computed at write time and
         # persisted, so ANN retrieval (semantic_search / pgvector HNSW) works
@@ -1786,7 +1793,8 @@ class PostgresAdapter(AdapterABC):
                     SELECT column_name FROM information_schema.columns
                     WHERE table_name = 'amfs_outcomes'
                       AND column_name IN (
-                        'actions_taken', 'task_embedding', 'environment', 'task_text'
+                        'actions_taken', 'task_embedding', 'environment', 'task_text',
+                        'verified_by'
                       )
                     """,
                 )
@@ -1795,6 +1803,7 @@ class PostgresAdapter(AdapterABC):
                 self._has_outcome_embedding_col = "task_embedding" in found
                 self._has_outcome_env_col = "environment" in found
                 self._has_task_text_col = "task_text" in found
+                self._has_verified_by_col = "verified_by" in found
 
     # ------------------------------------------------------------------
     # read
@@ -3917,13 +3926,29 @@ class PostgresAdapter(AdapterABC):
                     json.dumps(dict(record.causal_entry_versions or {})),
                 ]
                 if self._has_action_cols:
+                    # The entities this outcome is about. The SDK derives them
+                    # from the cited keys; a record built without them (an
+                    # older client, a direct adapter caller) gets the same
+                    # derivation here, because the trigger's uplift refresh
+                    # (migration 012) finds an entity's sessions by this column.
+                    entity_paths = list(record.entity_paths or []) or entity_paths_of(
+                        sorted(outcome_read_keys(record))
+                    )
                     columns += ["actions_taken", "entity_paths", "situation"]
                     placeholders += ["%s::jsonb", "%s", "%s"]
                     params += [
                         json.dumps(list(record.actions_taken or []), default=str),
-                        list(record.entity_paths or []),
+                        entity_paths,
                         record.situation,
                     ]
+                # Who decided the outcome when it was not the agent (CI, a
+                # monitor, a reviewer); the trigger weighs a verified outcome
+                # by VERIFIED_EVIDENCE_WEIGHT (migration 012).
+                verified_by = outcome_verified_by(record)
+                if self._has_verified_by_col and verified_by:
+                    columns.append("verified_by")
+                    placeholders.append("%s")
+                    params.append(verified_by)
                 if getattr(self, "_has_outcome_env_col", False):
                     env = recorded_environment({"session_metadata": record.session_metadata or {}})
                     if env:
@@ -3999,6 +4024,111 @@ class PostgresAdapter(AdapterABC):
                 cur.execute(f"SELECT count(*) AS cnt FROM amfs_outcomes WHERE {where}", params)
                 row = cur.fetchone()
         return int(row["cnt"]) if row else 0
+
+    def learning_series(
+        self,
+        *,
+        since: datetime,
+        agent: str | None = None,
+        entity_path: str | None = None,
+        limit: int = 5000,
+        visible_agents: Collection[str] | None = None,
+    ) -> dict[str, Any]:
+        """The rows ``amfs_core.learning.learning_curve`` reads: the newest
+        ``limit`` outcomes in the window, returned oldest first, and the regime
+        shifts among the entries they cited.
+
+        ``sessions`` carries ``(at, outcome_type, agent_id, verified_by)`` per
+        outcome. When the window holds more than ``limit`` outcomes the series
+        keeps the most recent ones — the curve is about where the agent is
+        now — and says so with ``truncated``; the shifts are then bounded by
+        the oldest session kept, so every shift reported falls inside the
+        sessions returned. ``shifts`` is one row per moment a cited entry was
+        discredited — distinct ``(entity_path, key, discredited_at)`` across
+        the entry's versions, since the step copies the timestamp forward
+        until evidence lifts it. "Cited" counts the terminal causal keys and
+        the failed attempts' keys alike, as the uplift refresh does.
+        ``visible_agents`` scopes everything to the agents the caller may see,
+        and ``agent`` narrows on top of it, never instead of it; an agent
+        outside the scope answers an empty series.
+        """
+        empty: dict[str, Any] = {"sessions": [], "shifts": [], "truncated": False}
+        if visible_agents is not None and not visible_agents:
+            return empty
+        conditions = ["namespace = %s", "committed_at >= %s"]
+        params: list[Any] = [self._namespace, since]
+        if visible_agents is not None:
+            conditions.append("agent_id = ANY(%s)")
+            params.append(list(visible_agents))
+        if agent:
+            if visible_agents is not None and agent not in visible_agents:
+                return empty
+            conditions.append("agent_id = %s")
+            params.append(agent)
+        if entity_path:
+            if self._has_action_cols:
+                conditions.append("entity_paths @> ARRAY[%s]::text[]")
+                params.append(entity_path)
+            else:
+                conditions.append(
+                    "EXISTS (SELECT 1 FROM unnest(causal_entry_keys) AS ek WHERE ek LIKE %s)"
+                )
+                params.append(f"{entity_path}/%")
+        where = " AND ".join(conditions)
+        verified = "verified_by" if self._has_verified_by_col else "NULL::text AS verified_by"
+        cap = max(1, int(limit))
+        # Newest first under the cap, so a busy account's series ends at its
+        # current sessions rather than stopping at the start of the window;
+        # reversed below so the curve reads oldest to newest.
+        newest = f"""SELECT id, committed_at, outcome_type, agent_id, causal_entry_keys, attempts
+                     FROM amfs_outcomes
+                     WHERE {where}
+                     ORDER BY committed_at DESC, id DESC
+                     LIMIT %s"""
+        with self._pool.connection() as conn, conn.cursor() as cur:
+            # One row past the cap tells "exactly the cap" from "more than
+            # it"; a window holding exactly ``limit`` outcomes is complete.
+            cur.execute(
+                f"""WITH win AS ({newest})
+                    SELECT committed_at AS at, outcome_type, agent_id, {verified}
+                    FROM amfs_outcomes
+                    WHERE id IN (SELECT id FROM win)
+                    ORDER BY committed_at ASC, id ASC""",
+                (*params, cap + 1),
+            )
+            sessions = [dict(row) for row in cur.fetchall()]
+            if not sessions:
+                return empty
+            truncated = len(sessions) > cap
+            if truncated:
+                del sessions[0]
+            # A shift before the oldest session kept has no "before" in this
+            # series; bound the shifts by what the sessions actually cover.
+            shift_since = max(since, sessions[0]["at"]) if truncated else since
+            shift_conditions = ["e.namespace = %s", "e.discredited_at IS NOT NULL", "e.discredited_at >= %s"]
+            shift_params: list[Any] = [self._namespace, shift_since]
+            if entity_path:
+                shift_conditions.append("e.entity_path = %s")
+                shift_params.append(entity_path)
+            cur.execute(
+                f"""WITH win AS ({newest}),
+                    cited AS (
+                        SELECT DISTINCT x AS spec
+                        FROM win o, unnest(COALESCE(o.causal_entry_keys, '{{}}')) AS x
+                        UNION
+                        SELECT DISTINCT jsonb_array_elements_text(
+                                   COALESCE(a->'causal_entry_keys', '[]'::jsonb))
+                        FROM win o, jsonb_array_elements(COALESCE(o.attempts, '[]'::jsonb)) AS a
+                    )
+                    SELECT DISTINCT e.entity_path, e.key, e.discredited_at AS at
+                    FROM amfs_memory_entries e
+                    JOIN cited c ON c.spec = e.entity_path || '/' || e.key
+                    WHERE {" AND ".join(shift_conditions)}
+                    ORDER BY e.discredited_at ASC""",
+                (*params, cap, *shift_params),
+            )
+            shifts = [dict(row) for row in cur.fetchall()]
+        return {"sessions": sessions, "shifts": shifts, "truncated": truncated}
 
     def list_outcomes(
         self,
@@ -4963,6 +5093,8 @@ class PostgresAdapter(AdapterABC):
             last_outcome_at=row.get("last_outcome_at"),
             discredited_at=row.get("discredited_at"),
             validators=_validators_of(row),
+            uplift=float(row["uplift"]) if row.get("uplift") is not None else None,
+            uplift_sessions=int(row.get("uplift_sessions") or 0),
             recall_count=row.get("recall_count", 0),
             priority_score=float(row["priority_score"]) if row.get("priority_score") is not None else None,
             tier=row.get("tier", 3),
