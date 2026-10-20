@@ -125,6 +125,11 @@ AMFS is GitHub for agent memory, split into two layers. The open-source core giv
 | Progressive retrieval (`depth`) | Yes | Yes |
 | Importance evaluator hook (`ImportanceEvaluator` ABC) | Yes | Yes |
 | Cortex drift gate (skip-redundant recompilations) | Yes | Yes |
+| Evidence sections on the briefing — `validated`, `discredited` (with `replaced_by`), `regime_shift`, `tried_here`; `evidence_status` on every hot-context row; `compact` and `since` | Yes | Yes |
+| Action priors on retrieve — `include_priors` + `candidate_actions` return per-action won/lost here and a recommendation (`act` / `explore` / `escalate`; `explore` assigned per agent) | Yes | Yes |
+| Failed attempts inside one trace (`record_attempt`) — the entries read before the failure are charged, the recovery is credited, a `lesson-contrast-*` entry names both | Yes | Yes |
+| Reuse ledger — what memory was read back, by whom, and whether it was written by another agent (`GET /api/v1/reuse`, `writer=` filter) | Yes | Yes |
+| Byte-faithful capture of model exchanges as sealed traces (OpenRouter proxy `AMFS_PROXY_CAPTURE`; default off, opt-in per account on the hosted gateway) | Yes | Yes |
 | LLM importance scoring (3-dimension) | — | Yes |
 | Background tier recomputation (`TierWorker`) | — | Yes |
 | **Git-like Timeline** | | |
@@ -235,6 +240,9 @@ AMFS is GitHub for agent memory, split into two layers. The open-source core giv
 | Gate self-tests in production: A/A monitor, injected wrong fixes, reward probe, evidence invariants | — | Yes |
 | Repair-prompt A/B with win rule and lineage readout | — | Yes |
 | Ship and rollback key by key; review triage queue; fix event trail | — | Yes |
+| Verify sweep — recurrence before and after the ship, two-proportion test; a canary-shipped fix is read against its control arm; an undecided reading is on the event trail (`verify_inconclusive`) | — | Yes |
+| Managed models — SFT and preference training on the account's own traces behind an eval gate, promoted version served through the gateway (`/api/v1/chat/completions`) | — | Yes |
+| Training-data export (`sft`, `dpo`, `team_sft`) — account admins on the dashboard, or an API key an admin created | — | Yes |
 | **Dashboard (Pro)** | | |
 | Memory explorer with interactive causal graph | — | Yes |
 | Decision trace explorer with enriched context and causal graph | — | Yes |
@@ -248,6 +256,22 @@ AMFS is GitHub for agent memory, split into two layers. The open-source core giv
 | Memory Tiers dashboard (distribution, entry browser) | — | Yes |
 | Guided migration from Mem0 and Zep (preview, resume, undo) | — | Yes |
 | Extended MCP server (Pro tools) | — | Yes |
+
+---
+
+## What we claim, and on what evidence
+
+Every public sentence about the loop sits on a rung of one ladder. A rung is published only once its evidence exists; the copy on this page, the README and the site cites the rung it stands on.
+
+| Rung | Sentence | Evidence | Status |
+|:--|:--|:--|:--|
+| 1 | Agents that stop repeating mistakes: every outcome moves the evidence behind what the agent relied on, and the next run gets a recommendation instead of a guess. | The evidence arithmetic and `recommend()` in OSS `amfs_core`; level-0 results in the RSI paper. | Published |
+| 2 | A self-improvement loop for AI agents, gated by held-out outcomes, reversible, audited, preregistered. | Tier 1–3 of the repair loop live in production with the gate benchmark scorecard (false-accept and true-reject rates on injected wrong fixes). | Mechanism shipped; scorecard read on dev, production readings pending |
+| 3 | Level 1 adds to level 0. | A confirmatory re-run on a single preregistered primary endpoint, positive at the preregistered alpha. | Not claimed |
+| 4 | Each cycle improves faster than the last. | An ignition series over two or more cycles, regressions reported per family. | Not claimed |
+| 5 | Externally validated. | Engine on/off positive on a public benchmark, a second judge family, one outside replication. | Not claimed |
+
+Never claimed, at any rung: "solved self-improvement", "open-ended capability gain", "autonomous AI research". Nothing here does that.
 
 ---
 
