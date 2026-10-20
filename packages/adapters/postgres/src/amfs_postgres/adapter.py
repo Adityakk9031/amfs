@@ -4034,19 +4034,25 @@ class PostgresAdapter(AdapterABC):
         limit: int = 5000,
         visible_agents: Collection[str] | None = None,
     ) -> dict[str, Any]:
-        """The rows ``amfs_core.learning.learning_curve`` reads: the outcomes
-        in the window, oldest first, and the regime shifts among the entries
-        they cited.
+        """The rows ``amfs_core.learning.learning_curve`` reads: the newest
+        ``limit`` outcomes in the window, returned oldest first, and the regime
+        shifts among the entries they cited.
 
         ``sessions`` carries ``(at, outcome_type, agent_id, verified_by)`` per
-        outcome. ``shifts`` is one row per moment a cited entry was discredited
-        — distinct ``(entity_path, key, discredited_at)`` across the entry's
-        versions, since the step copies the timestamp forward until evidence
-        lifts it. ``visible_agents`` scopes both to the agents the caller may
-        see, and ``agent`` narrows on top of it, never instead of it; an agent
+        outcome. When the window holds more than ``limit`` outcomes the series
+        keeps the most recent ones — the curve is about where the agent is
+        now — and says so with ``truncated``; the shifts are then bounded by
+        the oldest session kept, so every shift reported falls inside the
+        sessions returned. ``shifts`` is one row per moment a cited entry was
+        discredited — distinct ``(entity_path, key, discredited_at)`` across
+        the entry's versions, since the step copies the timestamp forward
+        until evidence lifts it. "Cited" counts the terminal causal keys and
+        the failed attempts' keys alike, as the uplift refresh does.
+        ``visible_agents`` scopes everything to the agents the caller may see,
+        and ``agent`` narrows on top of it, never instead of it; an agent
         outside the scope answers an empty series.
         """
-        empty: dict[str, Any] = {"sessions": [], "shifts": []}
+        empty: dict[str, Any] = {"sessions": [], "shifts": [], "truncated": False}
         if visible_agents is not None and not visible_agents:
             return empty
         conditions = ["namespace = %s", "committed_at >= %s"]
@@ -4070,38 +4076,55 @@ class PostgresAdapter(AdapterABC):
                 params.append(f"{entity_path}/%")
         where = " AND ".join(conditions)
         verified = "verified_by" if self._has_verified_by_col else "NULL::text AS verified_by"
+        cap = max(1, int(limit))
+        # Newest first under the cap, so a busy account's series ends at its
+        # current sessions rather than stopping at the start of the window;
+        # reversed below so the curve reads oldest to newest.
+        newest = f"""SELECT id, committed_at, outcome_type, agent_id, causal_entry_keys, attempts
+                     FROM amfs_outcomes
+                     WHERE {where}
+                     ORDER BY committed_at DESC, id DESC
+                     LIMIT %s"""
         with self._pool.connection() as conn, conn.cursor() as cur:
             cur.execute(
-                f"""SELECT committed_at AS at, outcome_type, agent_id, {verified}
+                f"""WITH win AS ({newest})
+                    SELECT committed_at AS at, outcome_type, agent_id, {verified}
                     FROM amfs_outcomes
-                    WHERE {where}
-                    ORDER BY committed_at ASC, id ASC
-                    LIMIT %s""",
-                (*params, max(1, int(limit))),
+                    WHERE id IN (SELECT id FROM win)
+                    ORDER BY committed_at ASC, id ASC""",
+                (*params, cap),
             )
             sessions = [dict(row) for row in cur.fetchall()]
             if not sessions:
                 return empty
+            truncated = len(sessions) >= cap
+            # A shift before the oldest session kept has no "before" in this
+            # series; bound the shifts by what the sessions actually cover.
+            shift_since = max(since, sessions[0]["at"]) if truncated else since
             shift_conditions = ["e.namespace = %s", "e.discredited_at IS NOT NULL", "e.discredited_at >= %s"]
-            shift_params: list[Any] = [self._namespace, since]
+            shift_params: list[Any] = [self._namespace, shift_since]
             if entity_path:
                 shift_conditions.append("e.entity_path = %s")
                 shift_params.append(entity_path)
             cur.execute(
-                f"""WITH cited AS (
+                f"""WITH win AS ({newest}),
+                    cited AS (
                         SELECT DISTINCT x AS spec
-                        FROM (SELECT causal_entry_keys FROM amfs_outcomes WHERE {where} LIMIT %s) o,
-                             unnest(o.causal_entry_keys) AS x
+                        FROM win o, unnest(COALESCE(o.causal_entry_keys, '{{}}')) AS x
+                        UNION
+                        SELECT DISTINCT jsonb_array_elements_text(
+                                   COALESCE(a->'causal_entry_keys', '[]'::jsonb))
+                        FROM win o, jsonb_array_elements(COALESCE(o.attempts, '[]'::jsonb)) AS a
                     )
                     SELECT DISTINCT e.entity_path, e.key, e.discredited_at AS at
                     FROM amfs_memory_entries e
                     JOIN cited c ON c.spec = e.entity_path || '/' || e.key
                     WHERE {" AND ".join(shift_conditions)}
                     ORDER BY e.discredited_at ASC""",
-                (*params, max(1, int(limit)), *shift_params),
+                (*params, cap, *shift_params),
             )
             shifts = [dict(row) for row in cur.fetchall()]
-        return {"sessions": sessions, "shifts": shifts}
+        return {"sessions": sessions, "shifts": shifts, "truncated": truncated}
 
     def list_outcomes(
         self,

@@ -168,13 +168,16 @@ def learning_curve(
     if n == 0:
         return out
 
-    first = flags[:window]
-    latest = flags[-window:]
-    out["first"] = {"sessions": len(first), "success_rate": _rate(first)}
-    out["latest"] = {"sessions": len(latest), "success_rate": _rate(latest)}
-    # The headline compares two windows that do not overlap. With fewer than
-    # two windows' worth of sessions there is no "then" and "now" yet.
-    if n >= 2 * min_sessions and n >= window + min_sessions:
+    # The headline compares two windows that never overlap: the first and the
+    # latest ``window`` sessions when there are at least two windows' worth,
+    # shorter equal halves until then, and nothing while a half would be
+    # under ``min_sessions`` — there is no "then" and "now" in five sessions.
+    half = min(window, n // 2)
+    if half >= min_sessions:
+        first = flags[:half]
+        latest = flags[-half:]
+        out["first"] = {"sessions": half, "success_rate": _rate(first)}
+        out["latest"] = {"sessions": half, "success_rate": _rate(latest)}
         out["change"] = round(out["latest"]["success_rate"] - out["first"]["success_rate"], 4)
 
     bins = min(episodes, n)

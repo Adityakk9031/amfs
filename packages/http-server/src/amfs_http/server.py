@@ -5993,7 +5993,9 @@ def learning_curve_endpoint(
 
     Scoped to the agents the caller may see, like ``/reuse``; ``agent`` and
     ``entity_path`` narrow on top of that. ``days`` is clamped so a
-    hand-written URL cannot ask for an unbounded scan.
+    hand-written URL cannot ask for an unbounded scan, and the series is the
+    newest 5000 sessions in the window: ``truncated`` says when there were
+    more, and ``span.from`` where the curve actually starts.
     """
     from amfs_core.learning import MAX_EPISODES, learning_curve
 
@@ -6020,7 +6022,7 @@ def learning_curve_endpoint(
     curve = learning_curve(
         data.get("sessions") or [], shifts=data.get("shifts") or [], window=window, episodes=episodes
     )
-    return {**head, "available": True, **curve}
+    return {**head, "available": True, "truncated": bool(data.get("truncated")), **curve}
 
 
 @app.get("/api/v1/agents/{agent_id:path}/memory-graph")

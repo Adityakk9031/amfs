@@ -388,12 +388,75 @@ def test_learning_series_returns_the_sessions_in_order_and_the_shifts_among_cite
     on_entity = adapter.learning_series(since=since, entity_path="svc/mod")
     assert len(on_entity["sessions"]) == 10  # a's nine on the rule plus b's one on other
     assert len(adapter.learning_series(since=since, entity_path="elsewhere/thing")["sessions"]) == 1
-    assert adapter.learning_series(since=since, visible_agents=set()) == {"sessions": [], "shifts": []}
-    assert adapter.learning_series(since=since, agent="a", visible_agents={"b"}) == {
-        "sessions": [],
-        "shifts": [],
-    }
+    empty = {"sessions": [], "shifts": [], "truncated": False}
+    assert adapter.learning_series(since=since, visible_agents=set()) == empty
+    assert adapter.learning_series(since=since, agent="a", visible_agents={"b"}) == empty
     only_b = adapter.learning_series(since=since, visible_agents={"b"})
     assert [s["agent_id"] for s in only_b["sessions"]] == ["b"]
     # b's one failure discredited ``other``; b never cited the rule.
     assert [(s["entity_path"], s["key"]) for s in only_b["shifts"]] == [("svc/mod", "other")]
+    assert series["truncated"] is False
+
+
+def test_learning_series_keeps_the_newest_sessions_under_the_cap(adapter, monkeypatch) -> None:
+    """A busy account's curve ends at its current sessions. The cap keeps the
+    newest rows, still returned oldest first, and the shifts are bounded by
+    the oldest session kept so none is reported without its sessions."""
+    from datetime import timedelta
+
+    monkeypatch.delenv(ev.OUTCOME_MODEL_ENV, raising=False)
+    adapter.write(_entry("early", 0.9))
+    adapter.write(_entry("late", 0.9))
+    # Two failures on ``early`` discredit it, then six successes on ``late``.
+    for _ in range(2):
+        adapter.commit_outcome(_record(OutcomeType.FAILURE, ["svc/mod/early"]))
+    early_shift = adapter.read("svc/mod", "early").discredited_at
+    assert early_shift is not None
+    for _ in range(6):
+        adapter.commit_outcome(_record(OutcomeType.SUCCESS, ["svc/mod/late"]))
+
+    since = datetime.now(UTC) - timedelta(days=1)
+    whole = adapter.learning_series(since=since)
+    assert [s["outcome_type"] for s in whole["sessions"]] == ["failure"] * 2 + ["success"] * 6
+    assert whole["truncated"] is False
+    assert [s["key"] for s in whole["shifts"]] == ["early"]
+
+    capped = adapter.learning_series(since=since, limit=4)
+    assert [s["outcome_type"] for s in capped["sessions"]] == ["success"] * 4
+    ats = [s["at"] for s in capped["sessions"]]
+    assert ats == sorted(ats)
+    assert capped["truncated"] is True
+    # The discredit of ``early`` happened before the oldest session kept.
+    assert capped["shifts"] == []
+
+
+def test_learning_series_counts_entries_cited_only_in_failed_attempts(adapter, monkeypatch) -> None:
+    """An entry the agent relied on in an attempt that failed, and dropped
+    before the terminal step, is still one it relied on: its discredit is a
+    shift in this agent's series, as it is a read in the uplift refresh."""
+    from datetime import timedelta
+
+    monkeypatch.delenv(ev.OUTCOME_MODEL_ENV, raising=False)
+    adapter.write(_entry("stale", 0.9))
+    adapter.write(_entry("fresh", 0.9))
+    for _ in range(2):
+        adapter.commit_outcome(
+            _record(
+                OutcomeType.SUCCESS,
+                ["svc/mod/fresh"],
+                attempts=[
+                    AttemptRecord(
+                        attempt=1,
+                        outcome_type=OutcomeType.FAILURE,
+                        causal_entry_keys=["svc/mod/stale"],
+                        summary="followed stale; did not work",
+                    )
+                ],
+            )
+        )
+    stale = adapter.read("svc/mod", "stale")
+    assert stale.discredited_at is not None
+    since = datetime.now(UTC) - timedelta(days=1)
+    series = adapter.learning_series(since=since, agent="a")
+    assert [s["key"] for s in series["shifts"]] == ["stale"]
+    assert series["shifts"][0]["at"] == stale.discredited_at

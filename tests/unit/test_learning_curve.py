@@ -60,8 +60,24 @@ class TestCurve:
     def test_too_few_sessions_have_no_change_yet(self) -> None:
         out = learning.learning_curve(_rows("sfs"), window=10)
         assert out["sessions"] == 3
-        assert out["first"]["sessions"] == 3
+        assert out["first"] is None and out["latest"] is None
         assert out["change"] is None
+        # Five sessions would give halves of two: under min_sessions, no headline.
+        assert learning.learning_curve(_rows("sfsfs"), window=10)["change"] is None
+
+    def test_the_windows_never_overlap(self) -> None:
+        # 13 sessions under a window of 10 used to compare slices sharing
+        # seven points, which dilutes the delta; the halves shrink instead.
+        out = learning.learning_curve(_rows("ffffff" + "s" + "ssssss"), window=10)
+        assert out["first"] == {"sessions": 6, "success_rate": 0.0}
+        assert out["latest"] == {"sessions": 6, "success_rate": 1.0}
+        assert out["change"] == pytest.approx(1.0)
+        # Six sessions is the first point with two halves of min_sessions.
+        out = learning.learning_curve(_rows("fffsss"), window=10)
+        assert out["first"]["sessions"] == 3 and out["change"] == pytest.approx(1.0)
+        # With two full windows the halves stop growing.
+        out = learning.learning_curve(_rows("f" * 15 + "s" * 15), window=10)
+        assert out["first"]["sessions"] == 10 and out["latest"]["sessions"] == 10
 
     def test_rows_arrive_in_any_order_and_unknown_types_are_dropped(self) -> None:
         rows = _rows("sf")
