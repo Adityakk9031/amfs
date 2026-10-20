@@ -507,6 +507,7 @@ class AgentMemory:
         keys under the cap ahead of what a run set — the replay receiver's
         grader keys, say."""
         self._session_attributes = {}
+        self._declare_situation()
 
     @property
     def session_llm_calls(self) -> list[dict[str, Any]]:
@@ -588,6 +589,7 @@ class AgentMemory:
         clone._session_metadata = None
         clone._session_attributes = {}
         clone._session_llm_calls = []
+        clone._declare_situation()
         return clone
 
     # ------------------------------------------------------------------
@@ -1914,6 +1916,7 @@ class AgentMemory:
         self._read_tracker.clear()
         self._session_attributes = {}
         self._session_llm_calls = []
+        self._declare_situation()
         return updated
 
     def record_attempt(
@@ -2124,6 +2127,11 @@ class AgentMemory:
         string values up to 256 characters; anything else raises. Keys are
         lowercased. The bag is cleared when the trace is committed.
 
+        ``situation`` is also declared to the server on every request from
+        then on (``X-AMFS-Situation``, through an adapter that talks to one):
+        a canary on a fix for that situation routes only the sessions that
+        declare it, so declare it before the first read — ``Run.begin`` does.
+
         The key cap applies to the bag as merged, not to each call: a merge that
         would take it past 20 keys raises ``ValueError`` and leaves the bag as
         it was.
@@ -2136,7 +2144,26 @@ class AgentMemory:
         merged = {**self._session_attributes, **validated}
         _check_attribute_count(merged, "the session attribute bag")
         self._session_attributes = merged
+        if SITUATION_ATTRIBUTE in validated:
+            self._declare_situation()
         return dict(self._session_attributes)
+
+    def _declare_situation(self) -> None:
+        """Tell the adapter the situation the bag now carries, when it can
+        listen (``HttpAdapter.declare_situation``; the local adapters have no
+        request to put it on). A server running a canary on a fix for one
+        situation routes a session into an arm only while it declares that
+        situation, so the header follows the bag: set with the attribute —
+        ``Run.begin(situation=...)`` sets it before the first read — and
+        dropped when the bag is cleared at commit. Never raises."""
+        declare = getattr(self._adapter, "declare_situation", None)
+        if not callable(declare):
+            return
+        value = self._session_attributes.get(SITUATION_ATTRIBUTE)
+        try:
+            declare(str(value) if isinstance(value, str) and value.strip() else None)
+        except Exception:  # noqa: BLE001 - routing is the server's concern, not the run's
+            logger.debug("adapter.declare_situation failed", exc_info=True)
 
     def environment(self) -> dict[str, str]:
         """The run's environment as the session knows it: ``model``,

@@ -1231,6 +1231,14 @@ def amfs_retrieve(
         confidence_weight=confidence_weight,
         include_avoid=include_avoid,
     )
+    if situation and situation.strip():
+        # What ``Run.begin(situation=...)`` does for an SDK run: on the trace,
+        # and declared to the server from this request on, so a canary on a
+        # fix for this situation can route the session into an arm.
+        try:
+            mem.set_session_attributes({"situation": situation.strip()[:200]})
+        except (TypeError, ValueError):
+            pass  # a bag at the key cap: the retrieve still scopes on it
 
     # Prefer server-side semantic retrieval (embedder + pgvector live on the
     # server); falls back to client-side composite scoring for local adapters.
