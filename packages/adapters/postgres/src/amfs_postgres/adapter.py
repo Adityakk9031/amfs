@@ -2855,6 +2855,7 @@ class PostgresAdapter(AdapterABC):
         limit: int = 10,
         visible_agents: Collection[str] | None = None,
         agent: str | None = None,
+        writer: str | None = None,
     ) -> dict[str, Any]:
         """What memory has been reused since a point in time, and by whom.
 
@@ -2886,6 +2887,13 @@ class PostgresAdapter(AdapterABC):
         would be filtering a list already cut to ``limit`` by reuse volume, so a
         quiet agent's handoffs would be missing — and indistinguishable from that
         agent having none.
+
+        ``writer`` is the same narrowing from the other side: the window as seen
+        by one agent AS WRITER — the reads of memory it wrote. ``cross_surface``
+        is then exactly how many times another agent took its memory, and
+        ``by_agent`` names who. It composes with ``agent`` and with the
+        visibility scope the same way, and an agent the caller may not see
+        answers nothing.
         """
         empty: dict[str, Any] = {
             "reuses": 0,
@@ -2911,6 +2919,11 @@ class PostgresAdapter(AdapterABC):
                 return empty
             scope += " AND reused_by = %s"
             scope_params = (*scope_params, agent)
+        if writer:
+            if visible_agents is not None and writer not in visible_agents:
+                return empty
+            scope += " AND written_by = %s"
+            scope_params = (*scope_params, writer)
 
         try:
             # Every column is aliased and read by name: the pool's row factory is

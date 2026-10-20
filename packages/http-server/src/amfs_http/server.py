@@ -5888,6 +5888,7 @@ def reuse_summary(
     days: int = 7,
     limit: int = 10,
     agent: str | None = None,
+    writer: str | None = None,
     _auth: str | None = Depends(verify_api_key),
 ) -> dict[str, Any]:
     """Reuse over a window: how much, of what, by which agents, and across which.
@@ -5910,6 +5911,12 @@ def reuse_summary(
     ``limit`` by reuse volume first, so a caller keeping the rows that name its
     agent would silently lose a quiet agent's reuse and could not tell that apart
     from the agent having none.
+
+    ``writer`` narrows it to one agent as WRITER — the reads of memory it wrote —
+    so ``cross_surface`` is exactly how many times other agents took from it and
+    ``by_agent`` names them. Same reasoning, other side of the handoff. Both may
+    be given. The answer echoes ``writer`` so a caller can tell this server
+    applied it from an older one that ignored the parameter.
     """
     days = max(1, min(int(days or 7), 365))
     limit = max(1, min(int(limit or 10), 100))
@@ -5927,27 +5934,32 @@ def reuse_summary(
             "reason": "reuse events need the Postgres adapter",
         }
     agent = agent or None
+    writer = writer or None
     kwargs: dict[str, Any] = {
         "since": since,
         "limit": limit,
         "visible_agents": _visible_agent_ids(request),
     }
-    if agent is not None:
-        # This server carries no dependency on the adapter package — it duck-types
-        # whatever backend it was handed — so an adapter predating the parameter is
-        # a real deployment, not a hypothetical. Passing the keyword blindly would
-        # raise TypeError and take out the whole endpoint, including the
-        # account-wide answer that still works. Refusing just the narrowed question
-        # keeps a stale pairing degraded rather than broken.
-        if "agent" not in inspect.signature(summarise).parameters:
+    # This server carries no dependency on the adapter package — it duck-types
+    # whatever backend it was handed — so an adapter predating a parameter is a
+    # real deployment, not a hypothetical. Passing the keyword blindly would
+    # raise TypeError and take out the whole endpoint, including the
+    # account-wide answer that still works. Refusing just the narrowed question
+    # keeps a stale pairing degraded rather than broken.
+    accepted = inspect.signature(summarise).parameters
+    for name, value, side in (("agent", agent, "agent"), ("writer", writer, "writer")):
+        if value is None:
+            continue
+        if name not in accepted:
             return {
                 "since": since.isoformat(),
                 "days": days,
                 "available": False,
                 "agent": agent,
-                "reason": "this backend cannot scope reuse to one agent",
+                "writer": writer,
+                "reason": f"this backend cannot scope reuse to one {side}",
             }
-        kwargs["agent"] = agent
+        kwargs[name] = value
 
     summary = summarise(**kwargs)
     return {
@@ -5955,6 +5967,7 @@ def reuse_summary(
         "days": days,
         "available": True,
         "agent": agent,
+        "writer": writer,
         **summary,
     }
 
