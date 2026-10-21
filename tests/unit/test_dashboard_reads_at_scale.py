@@ -242,6 +242,59 @@ class TestStatsBreakdown:
         body = client.get("/api/v1/stats?breakdown=false").json()
         assert "agents" not in body and body["total_agents"] == 1
 
+    def test_the_loaded_and_filtered_route_carries_the_buckets_too(self, monkeypatch):
+        """A caller whose visibility is not a SQL predicate gets its stats
+        from loaded entries. ``breakdown=false`` drops the per-entity map
+        that the health donut used to count from, so the buckets must be
+        on this route as well, from the same definition."""
+        from datetime import UTC, datetime
+
+        from amfs_core.models import MemoryEntry, Provenance
+
+        def _e(key, path, conf, agent="a"):
+            return MemoryEntry(
+                entity_path=path, key=key, value="v", confidence=conf,
+                provenance=Provenance(
+                    agent_id=agent, session_id="s", written_at=datetime.now(UTC),
+                ),
+            )
+
+        rows = [
+            _e("k1", "acme/x", 1.0), _e("k2", "acme/x", 0.9),     # mean 0.95 → healthy
+            _e("k3", "acme/y", 0.5),                              # low
+            _e("k4", "acme/z", 0.2, agent="hidden"),              # filtered out below
+        ]
+
+        class _Adapter:
+            entries = rows
+
+            def stats_extended(self, *, scope=None, breakdown=True):
+                raise AssertionError("the SQL aggregate must not run for this caller")
+
+        class _Vis:
+            def filter_entries(self, rows):
+                return [r for r in rows if r.provenance.agent_id != "hidden"]
+
+        monkeypatch.setattr(server, "_visibility_scope", lambda request: (None, _Vis()))
+        client = _client(monkeypatch, _Adapter())
+        body = client.get("/api/v1/stats?breakdown=false").json()
+        assert "entities" not in body
+        assert body["total_entities"] == 2
+        assert body["entity_confidence"] == {
+            "avg": pytest.approx(0.725), "healthy": 1, "moderate": 0, "low": 1, "critical": 0,
+        }
+
+
+def test_the_bucket_edges_are_one_definition():
+    from amfs_core.aggregates import entity_confidence_buckets
+
+    assert entity_confidence_buckets([0.9, 0.7, 0.4, 0.39, 0.89]) == {
+        "avg": pytest.approx(0.656), "healthy": 1, "moderate": 2, "low": 1, "critical": 1,
+    }
+    assert entity_confidence_buckets([]) == {
+        "avg": 0.0, "healthy": 0, "moderate": 0, "low": 0, "critical": 0,
+    }
+
 
 # ── consolidation status counts in SQL ────────────────────────────────────
 
@@ -316,6 +369,49 @@ def test_digests_scope_and_limit_reach_the_adapter(monkeypatch):
     assert (calls[1]["digest_type"].value, calls[1]["written_by"], calls[1]["limit"]) == (
         "entity", "billing-agent", 50,
     )
+
+
+def test_written_by_resolves_the_agents_topics_as_the_topics_page_would():
+    """The subquery is the set ``entity_summaries`` lists for the agent: the
+    digests' branch, live rows only, no benchmark or system rows. Without
+    that, a main-branch entity digest showed up on an agent's list from a
+    write on another branch or under ``_system/``."""
+    import contextlib
+
+    from amfs_postgres.adapter import _EXCLUDE_SYSTEM_ROWS, PostgresAdapter
+
+    executed: list[tuple[str, tuple]] = []
+
+    class _Cur:
+        def execute(self, sql, params):
+            executed.append((sql, params))
+            return self
+
+        def fetchall(self):
+            return []
+
+    class _Pool:
+        @contextlib.contextmanager
+        def connection(self):
+            conn = types.SimpleNamespace(
+                cursor=lambda row_factory=None: contextlib.nullcontext(_Cur()),
+            )
+            yield conn
+
+    adapter = object.__new__(PostgresAdapter)
+    adapter._pool = _Pool()
+    adapter._get_current_account_id = lambda: None
+    adapter.list_digests(namespace="ns", branch="feature", written_by="billing-agent", limit=5)
+
+    (sql, params), = executed
+    sub = sql[sql.index("scope IN ("):]
+    assert sub.startswith(
+        "scope IN (SELECT DISTINCT entity_path FROM amfs_memory_entries"
+        " WHERE namespace = %s AND branch = %s AND agent_id = %s"
+        f" AND superseded_at IS NULL AND {_EXCLUDE_SYSTEM_ROWS})"
+    )
+    # namespace, branch (outer); namespace, branch, agent (subquery); limit.
+    assert params == ("ns", "feature", "ns", "feature", "billing-agent", 5)
 
 
 # ── the cluster graph is built from candidate pairs ───────────────────────

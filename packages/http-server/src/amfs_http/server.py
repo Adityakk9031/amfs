@@ -4030,8 +4030,10 @@ async def get_stats(
 
     ``breakdown=false`` leaves out the per-agent and per-entity count maps
     (``agents``, ``entities``), which on a large account are most of the
-    response; ``total_agents`` and ``total_entities`` stay. A dashboard hero
-    wants the totals. An adapter without the option returns the maps anyway.
+    response; ``total_agents``, ``total_entities`` and the
+    ``entity_confidence`` buckets stay, on every route to this answer — the
+    SQL aggregate and the loaded-and-filtered one alike. A dashboard hero
+    wants the totals; the health page wants the buckets.
     """
     mem = _get_memory()
 

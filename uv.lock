@@ -330,7 +330,7 @@ provides-extras = ["cli"]
 
 [[package]]
 name = "amfs-core"
-version = "0.3.52"
+version = "0.3.53"
 source = { editable = "packages/core" }
 dependencies = [
     { name = "pydantic" },

@@ -477,6 +477,7 @@ from amfs_core.aggregates import (  # noqa: E402
     CHARS_PER_TOKEN as _CHARS_PER_TOKEN,
     RECALL_TOKENS_CEIL as _RECALL_TOKENS_CEIL,
     RECALL_TOKENS_FLOOR as _RECALL_TOKENS_FLOOR,
+    entity_confidence_buckets,
 )
 
 # Guarded by recall_count, because an entry never recalled contributes zero
@@ -3834,14 +3835,8 @@ class PostgresAdapter(AdapterABC):
                     entity_rows = cur.fetchall()
                     total_agents = len(agent_rows)
                     total_entities = len(entity_rows)
-                    confs = [float(r["c"]) for r in entity_rows]
-                    buckets = {
-                        "entity_confidence_avg": (sum(confs) / len(confs)) if confs else 0.0,
-                        "entities_healthy": sum(1 for c in confs if c >= 0.9),
-                        "entities_moderate": sum(1 for c in confs if 0.7 <= c < 0.9),
-                        "entities_low": sum(1 for c in confs if 0.4 <= c < 0.7),
-                        "entities_critical": sum(1 for c in confs if c < 0.4),
-                    }
+                    # The same edges the pure-Python aggregate uses.
+                    buckets = entity_confidence_buckets(r["c"] for r in entity_rows)
                 else:
                     # Grouped subqueries rather than COUNT(DISTINCT ...): the
                     # distinct aggregate forces a sort of every row and keeps
@@ -3867,11 +3862,11 @@ class PostgresAdapter(AdapterABC):
                     total_agents = int(counts.get("total_agents") or 0)
                     total_entities = int(counts.get("total_entities") or 0)
                     buckets = {
-                        "entity_confidence_avg": float(counts.get("entity_confidence_avg") or 0),
-                        "entities_healthy": int(counts.get("entities_healthy") or 0),
-                        "entities_moderate": int(counts.get("entities_moderate") or 0),
-                        "entities_low": int(counts.get("entities_low") or 0),
-                        "entities_critical": int(counts.get("entities_critical") or 0),
+                        "avg": float(counts.get("entity_confidence_avg") or 0),
+                        "healthy": int(counts.get("entities_healthy") or 0),
+                        "moderate": int(counts.get("entities_moderate") or 0),
+                        "low": int(counts.get("entities_low") or 0),
+                        "critical": int(counts.get("entities_critical") or 0),
                     }
 
                 cur.execute(
@@ -3964,13 +3959,7 @@ class PostgresAdapter(AdapterABC):
             "memory_type_counts": {
                 (r["memory_type"] or "fact"): r["cnt"] for r in type_rows
             },
-            "entity_confidence": {
-                "avg": buckets["entity_confidence_avg"],
-                "healthy": buckets["entities_healthy"],
-                "moderate": buckets["entities_moderate"],
-                "low": buckets["entities_low"],
-                "critical": buckets["entities_critical"],
-            },
+            "entity_confidence": buckets,
         })
         return out
 
@@ -5396,11 +5385,15 @@ class PostgresAdapter(AdapterABC):
         if written_by:
             # The agent's entity paths, resolved in the database; RLS on the
             # entries table keeps the subquery to what the caller may see.
+            # Same branch as the digests, and without benchmark or system
+            # rows — the set ``entity_summaries`` would list for the agent,
+            # so a digest shows up here only for a topic that page shows.
             where.append(
                 "scope IN (SELECT DISTINCT entity_path FROM amfs_memory_entries"
-                " WHERE namespace = %s AND agent_id = %s AND superseded_at IS NULL)"
+                " WHERE namespace = %s AND branch = %s AND agent_id = %s"
+                f" AND superseded_at IS NULL AND {_EXCLUDE_SYSTEM_ROWS})"
             )
-            params.extend([namespace, written_by])
+            params.extend([namespace, branch, written_by])
         if account_id:
             where.append("account_id = %s")
             params.append(account_id)
