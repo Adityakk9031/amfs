@@ -3434,17 +3434,40 @@ class PostgresAdapter(AdapterABC):
             newest_entry_at=row["newest_entry_at"],
         )
 
+    #: ``sort`` values ``entity_summaries`` accepts, and the ORDER BY each is.
+    _ENTITY_SUMMARY_SORTS: dict[str, str] = {
+        "last_updated": "last_updated DESC NULLS LAST, entity_path",
+        "entry_count": "entry_count DESC, entity_path",
+        "total_recalls": "total_recalls DESC, entity_path",
+        "avg_confidence": "avg_confidence DESC NULLS LAST, entity_path",
+        "avg_confidence_asc": "avg_confidence ASC NULLS LAST, entity_path",
+        "entity_path": "entity_path",
+    }
+
     def entity_summaries(
         self,
         *,
         agent_ids: list[str] | None = None,
         scope: SqlScope | None = None,
+        q: str | None = None,
+        agent: str | None = None,
+        min_confidence: float | None = None,
+        sort: str = "last_updated",
+        limit: int | None = None,
+        offset: int = 0,
     ) -> list[dict[str, Any]]:
         """Per-entity aggregates via GROUP BY — never loads entry values.
 
         *scope* is a visibility predicate (room co-member rules and the like)
         that ``agent_ids`` alone cannot express; with it, a per-user dashboard
         gets this query instead of a Python pass over every entry.
+
+        *q* keeps the paths containing it (case-insensitive), *agent* the
+        entities that agent has written to, *min_confidence* those whose mean
+        confidence reaches it — the topics directory's filters, in SQL. With
+        *limit* one page comes back and every row carries ``total``, the
+        count before paging. Unpaged, the whole list is returned as before —
+        1.6 MB on a 4,000-entity account, so a directory should page.
         """
         conditions = ["namespace = %s", "branch = 'main'", "superseded_at IS NULL"]
         params: list[Any] = [self._namespace]
@@ -3453,6 +3476,24 @@ class PostgresAdapter(AdapterABC):
             params.append(list(agent_ids))
         if scope is not None:
             scope.apply(conditions, params)
+        if q:
+            pattern = "%" + q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+            conditions.append("entity_path ILIKE %s")
+            params.append(pattern)
+        having: list[str] = []
+        having_params: list[Any] = []
+        if agent:
+            having.append("BOOL_OR(agent_id = %s)")
+            having_params.append(agent)
+        if min_confidence is not None:
+            having.append("AVG(confidence) >= %s")
+            having_params.append(float(min_confidence))
+        if sort not in self._ENTITY_SUMMARY_SORTS:
+            raise ValueError(f"unknown sort {sort!r}")
+        order_by = self._ENTITY_SUMMARY_SORTS[sort]
+        page = ""
+        if limit is not None:
+            page = "LIMIT %s OFFSET %s"
         # No entity_path argument to this one: it is unscoped by construction,
         # so shared namespaces are always excluded. It groups by entity_path,
         # which would otherwise list a shared namespace's topics as though
@@ -3478,8 +3519,21 @@ class PostgresAdapter(AdapterABC):
             FROM amfs_memory_entries
             WHERE {where}
             GROUP BY entity_path
-            ORDER BY MAX(written_at) DESC
+            {("HAVING " + " AND ".join(having)) if having else ""}
         """
+        params.extend(having_params)
+        if limit is not None:
+            # Paged: the count before paging rides on every row (one window
+            # over the grouped rows, no second statement).
+            params.extend([int(limit), max(0, int(offset))])
+            sql = f"""
+                SELECT x.*, COUNT(*) OVER () AS total
+                FROM ({sql}) x
+                ORDER BY {order_by}
+                {page}
+            """
+        else:
+            sql = f"SELECT * FROM ({sql}) x ORDER BY {order_by}"
         with self._pool.connection() as conn:
             with conn.cursor() as cur:
                 # The checkout is one transaction (see _TenantRLSConnection),
@@ -3491,6 +3545,7 @@ class PostgresAdapter(AdapterABC):
 
         return [
             {
+                **({"total": int(r["total"])} if limit is not None else {}),
                 "entity_path": r["entity_path"],
                 "entry_count": r["entry_count"],
                 "avg_confidence": float(r["avg_confidence"] or 0),
@@ -3503,6 +3558,44 @@ class PostgresAdapter(AdapterABC):
             }
             for r in rows
         ]
+
+    def consolidation_ready_entities(
+        self,
+        *,
+        min_entries: int = 10,
+        limit: int = 10,
+        scope: SqlScope | None = None,
+    ) -> list[str]:
+        """Entity paths with at least *min_entries* live entries, largest first.
+
+        What the consolidation status card shows. Counted in SQL: the handler
+        used to load every entry on the account into Python to count them per
+        path — two to three minutes on 430K entries, for ten path names.
+        """
+        conditions = ["namespace = %s", "branch = 'main'", "superseded_at IS NULL"]
+        params: list[Any] = [self._namespace]
+        if scope is not None:
+            scope.apply(conditions, params)
+        conditions.append(_EXCLUDE_SHARED_PATHS)
+        conditions.append(_EXCLUDE_SYSTEM_ROWS)
+        where = " AND ".join(conditions)
+        params.extend([int(min_entries), int(limit)])
+        with self._pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(f"SET LOCAL work_mem = '{_AGGREGATE_WORK_MEM}'")
+                cur.execute(
+                    f"""
+                    SELECT entity_path
+                    FROM amfs_memory_entries
+                    WHERE {where}
+                    GROUP BY entity_path
+                    HAVING COUNT(*) >= %s
+                    ORDER BY COUNT(*) DESC, entity_path
+                    LIMIT %s
+                    """,
+                    params,
+                )
+                return [r["entity_path"] for r in cur.fetchall()]
 
     def agent_summaries(
         self,
@@ -3634,6 +3727,7 @@ class PostgresAdapter(AdapterABC):
         *,
         agent_ids: list[str] | None = None,
         scope: SqlScope | None = None,
+        breakdown: bool = True,
     ) -> dict[str, Any]:
         """Extended aggregate stats in SQL (recalls, weekly deltas, types).
 
@@ -3641,6 +3735,16 @@ class PostgresAdapter(AdapterABC):
         to the entry aggregates only: the reuse-event query below is keyed by
         account and reader agent, and an entry-visibility predicate has no
         meaning over event rows.
+
+        ``breakdown=False`` leaves out the per-agent and per-entity count maps
+        (``agents``, ``entities``) and takes the two distinct counts from one
+        grouped subquery each instead. On a 6,000-agent, 4,000-entity account
+        the maps were 600 KB of a response whose reader wanted two integers.
+
+        ``entity_confidence`` buckets the entities by their mean confidence
+        (``healthy`` >= 0.9, ``moderate`` >= 0.7, ``low`` >= 0.4, ``critical``
+        below) with the mean of those means as ``avg`` — the health page's
+        donut, which used to need every entity summary to draw four counts.
         """
         conditions = ["namespace = %s", "superseded_at IS NULL"]
         params: list[Any] = [self._namespace]
@@ -3697,23 +3801,78 @@ class PostgresAdapter(AdapterABC):
                 )
                 row = cur.fetchone()
 
-                cur.execute(
-                    f"""
-                    SELECT agent_id, COUNT(*) AS cnt
-                    FROM amfs_memory_entries WHERE {where} GROUP BY agent_id
-                    """,
-                    params,
-                )
-                agent_rows = cur.fetchall()
+                agent_rows: list[Any] = []
+                entity_rows: list[Any] = []
+                # Entities bucketed by mean confidence; one pass over the
+                # per-entity groups either way.
+                bucket_sql = """
+                    COUNT(*) AS total_entities,
+                    COALESCE(AVG(c), 0) AS entity_confidence_avg,
+                    COUNT(*) FILTER (WHERE c >= 0.9) AS entities_healthy,
+                    COUNT(*) FILTER (WHERE c >= 0.7 AND c < 0.9) AS entities_moderate,
+                    COUNT(*) FILTER (WHERE c >= 0.4 AND c < 0.7) AS entities_low,
+                    COUNT(*) FILTER (WHERE c < 0.4) AS entities_critical
+                """
+                if breakdown:
+                    cur.execute(
+                        f"""
+                        SELECT agent_id, COUNT(*) AS cnt
+                        FROM amfs_memory_entries WHERE {where} GROUP BY agent_id
+                        """,
+                        params,
+                    )
+                    agent_rows = cur.fetchall()
 
-                cur.execute(
-                    f"""
-                    SELECT entity_path, COUNT(*) AS cnt
-                    FROM amfs_memory_entries WHERE {where} GROUP BY entity_path
-                    """,
-                    params,
-                )
-                entity_rows = cur.fetchall()
+                    cur.execute(
+                        f"""
+                        SELECT entity_path, COUNT(*) AS cnt,
+                               COALESCE(AVG(confidence), 0) AS c
+                        FROM amfs_memory_entries WHERE {where} GROUP BY entity_path
+                        """,
+                        params,
+                    )
+                    entity_rows = cur.fetchall()
+                    total_agents = len(agent_rows)
+                    total_entities = len(entity_rows)
+                    confs = [float(r["c"]) for r in entity_rows]
+                    buckets = {
+                        "entity_confidence_avg": (sum(confs) / len(confs)) if confs else 0.0,
+                        "entities_healthy": sum(1 for c in confs if c >= 0.9),
+                        "entities_moderate": sum(1 for c in confs if 0.7 <= c < 0.9),
+                        "entities_low": sum(1 for c in confs if 0.4 <= c < 0.7),
+                        "entities_critical": sum(1 for c in confs if c < 0.4),
+                    }
+                else:
+                    # Grouped subqueries rather than COUNT(DISTINCT ...): the
+                    # distinct aggregate forces a sort of every row and keeps
+                    # the statement off the parallel plan (see above).
+                    cur.execute(
+                        f"""
+                        SELECT
+                            (SELECT COUNT(*) FROM (
+                                SELECT 1 FROM amfs_memory_entries WHERE {where}
+                                GROUP BY agent_id) a) AS total_agents,
+                            e.*
+                        FROM (
+                            SELECT {bucket_sql}
+                            FROM (
+                                SELECT COALESCE(AVG(confidence), 0) AS c
+                                FROM amfs_memory_entries WHERE {where}
+                                GROUP BY entity_path) g
+                        ) e
+                        """,
+                        [*params, *params],
+                    )
+                    counts = cur.fetchone() or {}
+                    total_agents = int(counts.get("total_agents") or 0)
+                    total_entities = int(counts.get("total_entities") or 0)
+                    buckets = {
+                        "entity_confidence_avg": float(counts.get("entity_confidence_avg") or 0),
+                        "entities_healthy": int(counts.get("entities_healthy") or 0),
+                        "entities_moderate": int(counts.get("entities_moderate") or 0),
+                        "entities_low": int(counts.get("entities_low") or 0),
+                        "entities_critical": int(counts.get("entities_critical") or 0),
+                    }
 
                 cur.execute(
                     f"""
@@ -3781,14 +3940,17 @@ class PostgresAdapter(AdapterABC):
                     # and the dashboard hides the trend line.
                     pass
 
-        return {
+        out: dict[str, Any] = {
             "recalls_this_week": recalls_this_week,
             "recalls_last_week": recalls_last_week,
             "total_entries": row["total_entries"] if row else 0,
-            "total_entities": len(entity_rows),
-            "total_agents": len(agent_rows),
-            "agents": {r["agent_id"]: r["cnt"] for r in agent_rows},
-            "entities": {r["entity_path"]: r["cnt"] for r in entity_rows},
+            "total_entities": total_entities,
+            "total_agents": total_agents,
+        }
+        if breakdown:
+            out["agents"] = {r["agent_id"]: r["cnt"] for r in agent_rows}
+            out["entities"] = {r["entity_path"]: r["cnt"] for r in entity_rows}
+        out.update({
             "confidence_avg": float(row["confidence_avg"] or 0) if row else 0.0,
             "confidence_min": float(row["confidence_min"] or 0) if row else 0.0,
             "confidence_max": float(row["confidence_max"] or 0) if row else 0.0,
@@ -3802,7 +3964,15 @@ class PostgresAdapter(AdapterABC):
             "memory_type_counts": {
                 (r["memory_type"] or "fact"): r["cnt"] for r in type_rows
             },
-        }
+            "entity_confidence": {
+                "avg": buckets["entity_confidence_avg"],
+                "healthy": buckets["entities_healthy"],
+                "moderate": buckets["entities_moderate"],
+                "low": buckets["entities_low"],
+                "critical": buckets["entities_critical"],
+            },
+        })
+        return out
 
     def share_stats(
         self,
@@ -5194,11 +5364,18 @@ class PostgresAdapter(AdapterABC):
         namespace: str = "default",
         branch: str = "main",
         *,
+        scope: str | None = None,
+        written_by: str | None = None,
         relevant_to: list[str] | None = None,
         limit: int | None = None,
     ) -> list[Digest]:
-        """List digests, optionally filtered by type and branch.
+        """List digests, optionally filtered by type, branch and scope.
 
+        ``scope`` keeps the digests compiled for exactly that scope — an
+        agent's brief, one entity — in SQL, so a page asking about one agent
+        does not receive every brief on the account (5 MB on a large one) to
+        pick its own out of. ``written_by`` keeps the digests whose scope is
+        an entity path that agent has live entries under.
         ``relevant_to`` keeps only digests that name one of the given strings
         — as their scope, or anywhere in their summary. The briefing scores a
         digest only when the entity or agent it is asked about appears in one
@@ -5213,6 +5390,17 @@ class PostgresAdapter(AdapterABC):
         if digest_type:
             where.append("digest_type = %s")
             params.append(digest_type.value)
+        if scope:
+            where.append("scope = %s")
+            params.append(scope)
+        if written_by:
+            # The agent's entity paths, resolved in the database; RLS on the
+            # entries table keeps the subquery to what the caller may see.
+            where.append(
+                "scope IN (SELECT DISTINCT entity_path FROM amfs_memory_entries"
+                " WHERE namespace = %s AND agent_id = %s AND superseded_at IS NULL)"
+            )
+            params.extend([namespace, written_by])
         if account_id:
             where.append("account_id = %s")
             params.append(account_id)
@@ -5761,7 +5949,37 @@ class PostgresAdapter(AdapterABC):
                         params,
                     )
 
-    def list_agents_enriched(self, namespace: str = "default") -> list[dict[str, Any]]:
+    #: ``sort`` values ``list_agents_enriched`` accepts, and the ORDER BY each is.
+    _ENRICHED_AGENT_SORTS: dict[str, str] = {
+        "last_active": "last_active DESC NULLS LAST, agent_id",
+        "entries_written": "entries_written DESC, agent_id",
+        "created_at": "created_at DESC NULLS LAST, agent_id",
+        "agent_id": "agent_id",
+    }
+
+    def list_agents_enriched(
+        self,
+        namespace: str = "default",
+        *,
+        agent_ids: list[str] | None = None,
+        q: str | None = None,
+        platform: str | None = None,
+        sort: str = "last_active",
+        limit: int | None = None,
+        offset: int = 0,
+    ) -> list[dict[str, Any]]:
+        """Enriched agent rows, optionally one page of them.
+
+        *agent_ids* narrows to the agents the caller may see, so a page is a
+        page of visible agents. *q* is a case-insensitive substring match on
+        the agent id, description, model, platform and primary repo;
+        *platform* keeps one platform. With *limit* set, every row carries
+        ``total`` — the count before paging — and ``active_7d``, how many of
+        those were active in the last seven days, so a directory can show
+        "showing 50 of 6,356 · 412 active this week" without a second query.
+        Unpaged, the whole roster is returned as before (3 MB on that account;
+        the dashboard pages).
+        """
         account_id = self._get_current_account_id()
         if account_id:
             account_filter = "AND a.account_id = %s"
@@ -5773,6 +5991,7 @@ class PostgresAdapter(AdapterABC):
             entry_account_filter = ""
             graph_account_filter = ""
             acct_params = []
+        agent_ids_filter = "AND a.agent_id = ANY(%s)" if agent_ids is not None else ""
 
         sql = f"""
             WITH agent_entries AS (
@@ -5845,14 +6064,47 @@ class PostgresAdapter(AdapterABC):
             LEFT JOIN agent_collab c ON c.agent_id = a.agent_id
             LEFT JOIN amfs_agent_group_members gm
                 ON gm.agent_id = a.agent_id AND gm.namespace = a.namespace
-            WHERE a.namespace = %s {account_filter}
-            ORDER BY last_active DESC NULLS LAST
+            WHERE a.namespace = %s {account_filter} {agent_ids_filter}
         """
         params: list[Any] = [
             namespace, *acct_params,
             namespace, *acct_params,
             namespace, *acct_params,
         ]
+        if agent_ids is not None:
+            params.append(list(agent_ids))
+        if sort not in self._ENRICHED_AGENT_SORTS:
+            raise ValueError(f"unknown sort {sort!r}")
+        order_by = self._ENRICHED_AGENT_SORTS[sort]
+        # The roster as a subquery so the search sees the computed columns
+        # and the page count is taken over the rows the search kept.
+        outer: list[str] = []
+        if q:
+            pattern = "%" + q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+            outer.append(
+                "(x.agent_id ILIKE %s OR x.description ILIKE %s OR x.model ILIKE %s"
+                " OR x.platform ILIKE %s OR x.primary_repo ILIKE %s)"
+            )
+            params.extend([pattern] * 5)
+        if platform:
+            outer.append("x.platform = %s")
+            params.append(platform)
+        outer_where = ("WHERE " + " AND ".join(outer)) if outer else ""
+        page = ""
+        if limit is not None:
+            page = "LIMIT %s OFFSET %s"
+            params.extend([int(limit), max(0, int(offset))])
+        sql = f"""
+            SELECT x.*,
+                   COUNT(*) OVER () AS total,
+                   COUNT(*) FILTER (
+                       WHERE x.last_active >= NOW() - INTERVAL '7 days'
+                   ) OVER () AS active_7d
+            FROM ({sql}) x
+            {outer_where}
+            ORDER BY {order_by}
+            {page}
+        """
 
         with self._pool.connection() as conn:
             with conn.cursor() as cur:
@@ -5865,6 +6117,11 @@ class PostgresAdapter(AdapterABC):
             if isinstance(tags, str):
                 tags = json.loads(tags)
             results.append({
+                **(
+                    {"total": int(r["total"]), "active_7d": int(r["active_7d"] or 0)}
+                    if limit is not None
+                    else {}
+                ),
                 "agent_id": r["agent_id"],
                 "created_at": r["created_at"],
                 "entries_written": r["entries_written"],
