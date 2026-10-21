@@ -2126,8 +2126,13 @@ def entry_quality_batch(
 
     scores: dict[tuple[str, str], float | None] = {}
     for entity_path, keys in wanted.items():
+        # Straight from the adapter, as the single route reads: ``mem.list``
+        # on the server's own handle keeps only shared entries and the
+        # server's, so another agent's private keys — which the topic page
+        # already lists — would come back null. The caller's visibility
+        # rule, applied below, is the only filter that belongs here.
         try:
-            entries = mem.list(entity_path, branch=branch)
+            entries = mem._adapter.list(entity_path, branch=branch)
         except Exception:
             logger.debug("quality batch: list failed for %s", entity_path, exc_info=True)
             entries = []

@@ -86,17 +86,33 @@ def test_a_missing_or_hidden_entry_is_a_null_score_not_an_error(client, mem, mon
     assert scores[0] is not None and scores[1:] == [None, None, None]
 
 
+def test_another_agents_private_entry_is_scored_like_the_single_route(client, mem):
+    """``mem.list`` on the server's handle keeps only shared entries and the
+    server's own; the single route reads through the adapter and scores a
+    private entry regardless. The batch must agree, or a topic page that
+    lists the entry shows no score for it."""
+    mem.as_agent("other-agent").write(PATH, "private", LONG, confidence=0.9, shared=False)
+    assert [e.key for e in mem.list(PATH)] == [], "precondition: hidden from the handle"
+
+    single = client.get(f"/api/v1/quality/{PATH}/private").json()["quality"]["score"]
+    batch = client.post(
+        "/api/v1/quality/batch", json={"items": [{"entity_path": PATH, "key": "private"}]}
+    ).json()["results"][0]["score"]
+    assert batch == single and batch is not None
+
+
 def test_each_topic_is_listed_once(client, mem, monkeypatch):
     for i in range(6):
         mem.write(PATH, f"k{i}", LONG, confidence=0.9)
     calls: list[str] = []
-    real = mem.list
+    adapter = mem._adapter
+    real = adapter.list
 
     def counting(entity_path=None, **kw):
         calls.append(entity_path)
         return real(entity_path, **kw)
 
-    monkeypatch.setattr(mem, "list", counting)
+    monkeypatch.setattr(adapter, "list", counting)
     client.post(
         "/api/v1/quality/batch",
         json={"items": [{"entity_path": PATH, "key": f"k{i}"} for i in range(6)]},
