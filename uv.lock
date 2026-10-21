@@ -9,7 +9,7 @@ resolution-markers = [
 ]
 
 [options]
-exclude-newer = "2026-10-19T07:13:30.124444Z"
+exclude-newer = "2026-10-19T09:25:38.336442Z"
 exclude-newer-span = "P2D"
 
 [manifest]
@@ -399,7 +399,7 @@ provides-extras = ["crewai"]
 
 [[package]]
 name = "amfs-http-server"
-version = "0.3.63"
+version = "0.3.64"
 source = { editable = "packages/http-server" }
 dependencies = [
     { name = "amfs" },

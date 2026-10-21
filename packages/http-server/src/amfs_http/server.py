@@ -2088,6 +2088,82 @@ def entry_quality(
     }
 
 
+class QualityBatchItem(BaseModel):
+    entity_path: str
+    key: str
+
+
+class QualityBatchRequest(BaseModel):
+    items: list[QualityBatchItem] = Field(..., max_length=2000)
+    branch: str | None = None
+
+
+@app.post("/api/v1/quality/batch")
+def entry_quality_batch(
+    request: Request,
+    body: QualityBatchRequest,
+    _auth: str | None = Depends(verify_api_key),
+) -> dict[str, Any]:
+    """Quality scores for many entries in one request.
+
+    The topic and agent pages used to ask ``/quality/{path}/{key}`` once per
+    entry, and each of those listed the whole topic again to find the
+    sibling keys — on a 365-entry topic that was 365 round trips of about a
+    second each, serialised three at a time, before the page rendered. Here
+    each topic is listed once and every requested key in it is scored from
+    that one list. An entry that does not exist, or that the caller may not
+    see, comes back with a null score rather than an error, so one bad key
+    does not fail the page.
+    """
+    branch = _effective_branch(request, body.branch)
+    mem = _get_memory()
+    vis = _active_visibility_filter(request)
+    evaluator = HeuristicQualityEvaluator()
+
+    wanted: dict[str, list[str]] = {}
+    for item in body.items:
+        wanted.setdefault(item.entity_path, []).append(item.key)
+
+    scores: dict[tuple[str, str], float | None] = {}
+    for entity_path, keys in wanted.items():
+        try:
+            entries = mem.list(entity_path, branch=branch)
+        except Exception:
+            logger.debug("quality batch: list failed for %s", entity_path, exc_info=True)
+            entries = []
+        if vis is not None:
+            entries = vis.filter_entries(entries)
+        by_key = {e.key: e for e in entries}
+        all_keys = list(by_key)
+        for key in keys:
+            entry = by_key.get(key)
+            if entry is None:
+                scores[(entity_path, key)] = None
+                continue
+            mt = (
+                entry.memory_type.value
+                if hasattr(entry.memory_type, "value")
+                else str(entry.memory_type)
+            )
+            report = evaluator.evaluate(
+                entry.value,
+                entity_path=entity_path,
+                key=key,
+                confidence=entry.confidence,
+                memory_type=mt,
+                pattern_refs=list(entry.provenance.pattern_refs),
+                existing_keys=[k for k in all_keys if k != key],
+            )
+            scores[(entity_path, key)] = report.score
+
+    return {
+        "results": [
+            {"entity_path": i.entity_path, "key": i.key, "score": scores[(i.entity_path, i.key)]}
+            for i in body.items
+        ]
+    }
+
+
 async def _scope_block(
     entity_path: str,
     key: str,

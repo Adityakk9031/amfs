@@ -251,7 +251,7 @@ def test_override_wins_and_never_goes_below_one(monkeypatch, host_has_8_cpus) ->
 # ── Sync-bodied routes run on the threadpool ─────────────────────────
 
 SYNC_ROUTES = [
-    "entry_quality", "get_usage", "list_api_keys", "create_api_key", "revoke_api_key",
+    "entry_quality", "entry_quality_batch", "get_usage", "list_api_keys", "create_api_key", "revoke_api_key",
     "list_audit_log", "list_teams", "create_team", "update_team", "delete_team",
     "list_team_members", "add_team_member", "update_team_member", "remove_team_member",
     "reinstate_team_member", "check_member_email", "list_detected_patterns",
