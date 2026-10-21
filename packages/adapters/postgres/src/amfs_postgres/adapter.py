@@ -183,6 +183,45 @@ def _paginate_sql(
     return query, params
 
 
+def priority_score_sql(now: datetime, config: Any | None = None) -> tuple[str, list[Any]]:
+    """``amfs_core.tiering.PriorityScorer.score`` as a SQL expression.
+
+    The tiers pages rank every current entry in the account by this score and
+    take the top 50 as Hot and the next 200 as Warm. Scoring in Python meant
+    loading the whole namespace first; on a 420K-entry account the two
+    requests the page makes together took an 8 GiB instance down. The
+    expression below is the same formula over the same columns, so the
+    database can order by it and hand back one page::
+
+        (alpha * importance + beta * recency) * freq_boost * time_decay
+
+    with ``importance = importance_score or confidence`` clamped to [0, 1],
+    ``recency = exp(-lambda * age_days)``, ``freq_boost = max(1, ln(1 +
+    recall_count))`` and ``time_decay = exp(-lambda * age_days / freq_boost)``.
+    ``importance_score`` of 0 falls through to confidence exactly as the
+    Python ``or`` does. Returns the expression and its parameters in placeholder
+    order: alpha, beta, lambda, *now*, lambda, *now*.
+    """
+    if config is None:
+        from amfs_core.models import TierConfig
+
+        config = TierConfig()
+    age_days = "GREATEST(0.0, EXTRACT(EPOCH FROM (%s - written_at)) / 86400.0)"
+    importance = (
+        "LEAST(1.0, GREATEST(0.0, COALESCE(NULLIF(importance_score, 0), confidence)::float8))"
+    )
+    freq_boost = "GREATEST(1.0, LN(1.0 + COALESCE(recall_count, 0)))"
+    expr = (
+        f"((%s * {importance} + %s * EXP(-%s * {age_days}))"
+        f" * {freq_boost}"
+        f" * EXP(-%s * {age_days} / {freq_boost}))"
+    )
+    # The age expression appears twice, each with its own ``now``.
+    lam = float(config.decay_lambda)
+    params: list[Any] = [float(config.alpha), float(config.beta), lam, now, lam, now]
+    return expr, params
+
+
 def list_conditions(
     namespace: str,
     entity_path: str | None,
@@ -2499,6 +2538,90 @@ class PostgresAdapter(AdapterABC):
                 cur.execute(f"SELECT COUNT(*) AS n FROM amfs_memory_entries WHERE {where}", params)
                 row = cur.fetchone()
         return int(row["n"]) if row else 0
+
+    def priority_stats(
+        self,
+        *,
+        scope: SqlScope | None = None,
+        agent_id: str | None = None,
+        now: datetime | None = None,
+        branch: str = "main",
+    ) -> tuple[int, float | None]:
+        """``(count, mean priority score)`` over the rows :meth:`list` returns.
+
+        What the tiers distribution needs and nothing more: the count fixes
+        the Hot/Warm/Archive split (the tiers are rank bands) and the mean is
+        the page's "average score". Computed by the database with
+        :func:`priority_score_sql`; no entry row leaves it.
+        """
+        now = now or datetime.now(timezone.utc)
+        score, score_params = priority_score_sql(now)
+        with self._pool.connection() as conn:
+            with conn.cursor() as cur:
+                conditions, params = list_conditions(
+                    self._namespace,
+                    None,
+                    include_superseded=False,
+                    branch=branch,
+                    scope=scope,
+                    agent_id=agent_id,
+                    branch_scope=self._branch_scope(cur, branch),
+                )
+                where = " AND ".join(conditions)
+                cur.execute(
+                    f"SELECT COUNT(*) AS n, AVG({score}) AS mean "
+                    f"FROM amfs_memory_entries WHERE {where}",
+                    [*score_params, *params],
+                )
+                row = cur.fetchone()
+        if not row or not row["n"]:
+            return 0, None
+        mean = row["mean"]
+        return int(row["n"]), (float(mean) if mean is not None else None)
+
+    def list_by_priority(
+        self,
+        *,
+        scope: SqlScope | None = None,
+        agent_id: str | None = None,
+        limit: int,
+        offset: int = 0,
+        now: datetime | None = None,
+        branch: str = "main",
+    ) -> list[MemoryEntry]:
+        """One page of the rows :meth:`list` returns, highest priority first.
+
+        The order is :func:`priority_score_sql` descending with the stable
+        ``written_at DESC, entity_path, key`` tiebreak, so a page boundary is
+        deterministic. A tier is a band of this ranking: rows 0–49 are Hot,
+        50–249 Warm, the rest Archive — the caller picks *offset* and *limit*
+        from the band and the database returns only that page.
+        """
+        now = now or datetime.now(timezone.utc)
+        score, score_params = priority_score_sql(now)
+        with self._pool.connection() as conn:
+            with conn.cursor() as cur:
+                conditions, params = list_conditions(
+                    self._namespace,
+                    None,
+                    include_superseded=False,
+                    branch=branch,
+                    scope=scope,
+                    agent_id=agent_id,
+                    branch_scope=self._branch_scope(cur, branch),
+                )
+                where = " AND ".join(conditions)
+                query = (
+                    f"SELECT {entry_select(self._has_is_artifact_col, self._has_validators_col)} "
+                    f"FROM amfs_memory_entries WHERE {where} "
+                    f"ORDER BY {score} DESC, written_at DESC, entity_path, key"
+                )
+                query, all_params = _paginate_sql(
+                    query, [*params, *score_params], limit=limit, offset=offset
+                )
+                cur.execute(query, all_params)
+                rows = cur.fetchall()
+        return [self._row_to_entry(r) for r in rows]
 
     def entry_authors(self, refs: list[tuple[str, str]]) -> dict[tuple[str, str], str]:
         """Who wrote each ``(entity_path, key)``, for the current version.

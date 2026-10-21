@@ -465,3 +465,188 @@ class TestClusterCandidates:
         )
         digest = strategy(scope="account:ns").compute_clusters(agents, [edge])
         assert digest.summary["clusters"] == []
+
+
+# ── /pro/tiers in SQL ─────────────────────────────────────────────────────
+
+
+def _tier_rows(n: int):
+    """*n* entries whose priority order is their index: a newer, more recalled
+    row scores higher, so ``e0`` ranks first and ``e{n-1}`` last."""
+    from datetime import UTC, datetime, timedelta
+
+    from amfs_core.models import MemoryEntry, Provenance
+
+    now = datetime.now(UTC)
+    return [
+        MemoryEntry(
+            entity_path="acme/x", key=f"e{i}", value="v", confidence=0.9,
+            recall_count=max(0, n - i),
+            provenance=Provenance(
+                agent_id="a" if i % 2 else "b", session_id="s",
+                written_at=now - timedelta(days=i),
+            ),
+        )
+        for i in range(n)
+    ]
+
+
+class _RankingAdapter:
+    """Orders by the score in the database; ``list`` must never be needed."""
+
+    def __init__(self, rows):
+        self.rows = rows
+        self.calls: list[tuple] = []
+
+    def priority_stats(self, *, scope=None, agent_id=None, now=None, branch="main"):
+        self.calls.append(("stats", scope, agent_id))
+        rows = [r for r in self.rows if not agent_id or r.provenance.agent_id == agent_id]
+        return len(rows), (0.5 if rows else None)
+
+    def list_by_priority(self, *, scope=None, agent_id=None, limit, offset=0, now=None,
+                         branch="main"):
+        self.calls.append(("page", scope, agent_id, limit, offset))
+        rows = [r for r in self.rows if not agent_id or r.provenance.agent_id == agent_id]
+        return rows[offset:offset + limit]
+
+    def list(self, *args, **kwargs):
+        raise AssertionError("the ranked reads must not load the account")
+
+
+class TestTiersInSql:
+    def test_the_distribution_is_a_count_and_a_mean(self, monkeypatch):
+        adapter = _RankingAdapter(_tier_rows(300))
+        client = _client(monkeypatch, adapter)
+        body = client.get("/api/v1/pro/tiers/distribution").json()
+        assert (body["total"], body["hot"], body["warm"], body["archive"]) == (300, 50, 200, 50)
+        assert body["scored"] == 300 and body["avg_priority_score"] == 0.5
+        assert adapter.calls == [("stats", None, None)]
+
+    def test_a_small_account_fills_hot_first(self, monkeypatch):
+        client = _client(monkeypatch, _RankingAdapter(_tier_rows(30)))
+        body = client.get("/api/v1/pro/tiers/distribution").json()
+        assert (body["hot"], body["warm"], body["archive"]) == (30, 0, 0)
+
+    def test_an_empty_account_has_no_mean(self, monkeypatch):
+        client = _client(monkeypatch, _RankingAdapter([]))
+        body = client.get("/api/v1/pro/tiers/distribution").json()
+        assert body["total"] == 0 and body["avg_priority_score"] is None
+
+    def test_each_tier_is_one_page_at_its_offset(self, monkeypatch):
+        adapter = _RankingAdapter(_tier_rows(300))
+        client = _client(monkeypatch, adapter)
+        hot = client.get("/api/v1/pro/tiers/entries?tier=1&limit=10").json()
+        warm = client.get("/api/v1/pro/tiers/entries?tier=2&limit=10").json()
+        archive = client.get("/api/v1/pro/tiers/entries?tier=3&limit=10").json()
+        assert [e["key"] for e in hot] == [f"e{i}" for i in range(10)]
+        assert [e["key"] for e in warm] == [f"e{i}" for i in range(50, 60)]
+        assert [e["key"] for e in archive] == [f"e{i}" for i in range(250, 260)]
+        assert all(e["tier"] == 2 for e in warm)
+        assert [c for c in adapter.calls if c[0] == "page"] == [
+            ("page", None, None, 10, 0),
+            ("page", None, None, 10, 50),
+            ("page", None, None, 10, 250),
+        ]
+        # Scores are real and descend within the page.
+        scores = [e["priority_score"] for e in hot]
+        assert scores == sorted(scores, reverse=True) and scores[0] > 0
+
+    def test_a_tier_page_never_exceeds_its_band(self, monkeypatch):
+        adapter = _RankingAdapter(_tier_rows(300))
+        client = _client(monkeypatch, adapter)
+        hot = client.get("/api/v1/pro/tiers/entries?tier=1&limit=500").json()
+        assert len(hot) == 50 and adapter.calls[-1] == ("page", None, None, 50, 0)
+
+    def test_the_agent_filter_reaches_sql(self, monkeypatch):
+        adapter = _RankingAdapter(_tier_rows(20))
+        client = _client(monkeypatch, adapter)
+        body = client.get("/api/v1/pro/tiers/distribution?agent_id=a").json()
+        assert body["total"] == 10 and adapter.calls == [("stats", None, "a")]
+        page = client.get("/api/v1/pro/tiers/entries?tier=1&limit=3&agent_id=a").json()
+        assert [e["agent_id"] for e in page] == ["a", "a", "a"]
+
+    def test_the_scope_reaches_sql(self, monkeypatch):
+        from amfs_core.scope import SqlScope
+
+        scope = SqlScope("agent_id = %s", ("a",))
+
+        class _Vis:
+            def should_filter(self):
+                return True
+
+            def sql_predicate(self):
+                return scope
+
+        adapter = _RankingAdapter(_tier_rows(20))
+        client = _client(monkeypatch, adapter, vis=_Vis())
+        client.get("/api/v1/pro/tiers/distribution")
+        client.get("/api/v1/pro/tiers/entries?tier=1&limit=3")
+        assert adapter.calls == [("stats", scope, None), ("page", scope, None, 3, 0)]
+
+
+class TestTiersScoredHere:
+    """A visibility rule that only exists in Python, or an adapter that cannot
+    order by the score, is scored here — a page at a time, keeping only the
+    rows the response needs."""
+
+    class _PagingAdapter:
+        def __init__(self, rows):
+            self.rows = rows
+            self.pages: list[tuple[int, int]] = []
+
+        def list(self, entity_path=None, *, agent_id=None, limit=None, offset=0, **_):
+            self.pages.append((limit, offset))
+            rows = [r for r in self.rows if not agent_id or r.provenance.agent_id == agent_id]
+            return rows[offset:offset + limit] if limit is not None else rows
+
+    class _Vis:
+        """Hides every row written by agent ``b``; no SQL form."""
+
+        def should_filter(self):
+            return True
+
+        def sql_predicate(self):
+            return None
+
+        def filter_entries(self, rows):
+            return [r for r in rows if r.provenance.agent_id != "b"]
+
+    def test_the_fallback_pages_and_agrees_with_the_full_ranking(self, monkeypatch):
+        from amfs_core.tiering import PriorityScorer, TierAssigner
+
+        rows = _tier_rows(4500)
+        adapter = self._PagingAdapter(rows)
+        monkeypatch.setattr(server, "_TIER_SCAN_PAGE", 1000)
+        client = _client(monkeypatch, adapter, vis=self._Vis())
+
+        body = client.get("/api/v1/pro/tiers/distribution").json()
+        visible = [r for r in rows if r.provenance.agent_id == "a"]
+        assert body["total"] == len(visible) == 2250
+        assert (body["hot"], body["warm"], body["archive"]) == (50, 200, 2000)
+        assert adapter.pages == [(1000, 0), (1000, 1000), (1000, 2000), (1000, 3000), (1000, 4000)]
+
+        warm = client.get("/api/v1/pro/tiers/entries?tier=2&limit=5").json()
+        tiers, scores = TierAssigner().assign_with_scores(visible, PriorityScorer())
+        expected = sorted(
+            (r for r in visible if tiers[r.entry_key] == 2),
+            key=lambda r: scores[r.entry_key], reverse=True,
+        )[:5]
+        assert [e["key"] for e in warm] == [r.key for r in expected]
+        assert all(e["agent_id"] == "a" for e in warm)
+
+    def test_an_adapter_that_cannot_page_is_listed_whole(self, monkeypatch):
+        rows = _tier_rows(60)
+
+        class _Old:
+            entries = rows
+
+            def list(self, entity_path=None, *, include_superseded=False, branch="main"):
+                return list(rows)
+
+        client = _client(monkeypatch, _Old())
+        body = client.get("/api/v1/pro/tiers/distribution").json()
+        assert (body["total"], body["hot"], body["warm"]) == (60, 50, 10)
+        hot = client.get("/api/v1/pro/tiers/entries?tier=1&limit=3").json()
+        assert [e["key"] for e in hot] == ["e0", "e1", "e2"]
+        archive = client.get("/api/v1/pro/tiers/entries?tier=3&limit=3").json()
+        assert archive == [], "60 rows fill Hot and part of Warm; nothing reaches Archive"
