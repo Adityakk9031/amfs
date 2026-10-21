@@ -8744,15 +8744,27 @@ _TIER_SCAN_PAGE = 2000
 
 
 def _tier_scan(
-    mem: AgentMemory, py_filter: Any | None, agent_id: str | None, *, keep: int
+    mem: AgentMemory,
+    agent_id: str | None,
+    *,
+    scope: Any | None,
+    py_filter: Any | None,
+    vis: Any | None,
+    keep: int,
 ) -> tuple[int, float, list[tuple[float, MemoryEntry]]]:
     """Score the visible entries a page at a time, keeping only the top *keep*.
 
     The fallback for a visibility rule that only exists in Python or an
     adapter that cannot order by the score. Bounded in memory: a page is
     scored, folded into the count and the running sum, and all but the top
-    *keep* are dropped before the next page is read. An adapter that cannot
-    page (the in-memory ones) gets one unpaged ``list()``. Returns
+    *keep* are dropped before the next page is read.
+
+    The caller's visibility is ``(scope, py_filter)`` as ``_visibility_scope``
+    gave it: *scope* narrows each page in SQL, *py_filter* runs over the
+    loaded rows. An adapter that cannot take a scope or page (the in-memory
+    ones) gets one unpaged ``list()``, and then *vis* — the filter object the
+    scope was derived from — runs over it, so a rule that exists only as a
+    predicate is still applied rather than dropped. Returns
     ``(count, score_sum, top)`` with *top* highest first. Synchronous: call
     it via ``_offload``.
     """
@@ -8768,10 +8780,10 @@ def _tier_scan(
     top: list[tuple[float, int, MemoryEntry]] = []
     seq = 0
 
-    def fold(entries: list[MemoryEntry]) -> None:
+    def fold(entries: list[MemoryEntry], rule: Any | None) -> None:
         nonlocal count, score_sum, seq
-        if py_filter is not None:
-            entries = py_filter.filter_entries(entries)
+        if rule is not None:
+            entries = rule.filter_entries(entries)
         for e in entries:
             if agent_id and e.provenance.agent_id != agent_id:
                 continue
@@ -8789,11 +8801,16 @@ def _tier_scan(
     adapter = mem._adapter
     while True:
         try:
-            page = adapter.list(agent_id=agent_id, limit=_TIER_SCAN_PAGE, offset=offset)
+            page = adapter.list(
+                agent_id=agent_id, scope=scope, limit=_TIER_SCAN_PAGE, offset=offset
+            )
         except TypeError:
-            fold(_entries_by_agent(mem, agent_id) if agent_id else mem.list())
+            # No scope or paging in this adapter: the whole account, and the
+            # visibility rule — whichever form it took — applied here.
+            rule = py_filter if py_filter is not None else (vis if scope is not None else None)
+            fold(_entries_by_agent(mem, agent_id) if agent_id else mem.list(), rule)
             break
-        fold(page)
+        fold(page, py_filter)
         if len(page) < _TIER_SCAN_PAGE:
             break
         offset += _TIER_SCAN_PAGE
@@ -8845,7 +8862,8 @@ async def tiers_distribution(
         )
     else:
         total, score_sum, _top = await _offload(
-            _db_executor, _tier_scan, mem, py_filter, agent_id, keep=1
+            _db_executor, _tier_scan, mem, agent_id,
+            scope=scope, py_filter=py_filter, vis=_active_visibility_filter(request), keep=1,
         )
         mean = score_sum / total if total else None
 
@@ -8885,7 +8903,9 @@ async def tiers_entries(
         return [_tier_entry_dict(e, tier, scorer.score(e, now=now)) for e in entries]
 
     _count, _sum, top = await _offload(
-        _db_executor, _tier_scan, mem, py_filter, agent_id, keep=offset + page
+        _db_executor, _tier_scan, mem, agent_id,
+        scope=scope, py_filter=py_filter, vis=_active_visibility_filter(request),
+        keep=offset + page,
     )
     return [_tier_entry_dict(e, tier, s) for s, e in top[offset:offset + page]]
 

@@ -634,6 +634,69 @@ class TestTiersScoredHere:
         assert [e["key"] for e in warm] == [r.key for r in expected]
         assert all(e["agent_id"] == "a" for e in warm)
 
+    class _SqlVis:
+        """Hides agent ``b`` — as a predicate, and as a Python rule for an
+        adapter that cannot take the predicate."""
+
+        def __init__(self):
+            from amfs_core.scope import SqlScope
+
+            self.scope = SqlScope("agent_id = %s", ("a",))
+
+        def should_filter(self):
+            return True
+
+        def sql_predicate(self):
+            return self.scope
+
+        def filter_entries(self, rows):
+            return [r for r in rows if r.provenance.agent_id != "b"]
+
+    def test_a_sql_rule_reaches_a_paging_adapter_that_cannot_rank(self, monkeypatch):
+        """``_visibility_scope`` hands back the predicate and no Python filter;
+        an adapter that pages but cannot order by the score must still be
+        narrowed by it, page by page."""
+        rows = _tier_rows(40)
+        vis = self._SqlVis()
+
+        class _Scoped(self._PagingAdapter):
+            def __init__(self, rows):
+                super().__init__(rows)
+                self.scopes: list = []
+
+            def list(self, entity_path=None, *, scope=None, **kw):
+                self.scopes.append(scope)
+                rows = super().list(entity_path, **kw)
+                if scope is not None:
+                    rows = [r for r in rows if r.provenance.agent_id == scope.params[0]]
+                return rows
+
+        adapter = _Scoped(rows)
+        client = _client(monkeypatch, adapter, vis=vis)
+        body = client.get("/api/v1/pro/tiers/distribution").json()
+        assert body["total"] == 20
+        assert adapter.scopes and all(s is vis.scope for s in adapter.scopes)
+        hot = client.get("/api/v1/pro/tiers/entries?tier=1&limit=50").json()
+        assert len(hot) == 20 and all(e["agent_id"] == "a" for e in hot)
+
+    def test_a_sql_rule_runs_here_when_the_adapter_cannot_take_it(self, monkeypatch):
+        """An adapter with neither scope nor paging lists the whole account;
+        the rule the predicate came from is then applied over it, so the
+        caller never sees rows the predicate would have hidden."""
+        rows = _tier_rows(40)
+
+        class _Old:
+            entries = rows
+
+            def list(self, entity_path=None, *, include_superseded=False, branch="main"):
+                return list(rows)
+
+        client = _client(monkeypatch, _Old(), vis=self._SqlVis())
+        body = client.get("/api/v1/pro/tiers/distribution").json()
+        assert body["total"] == 20
+        hot = client.get("/api/v1/pro/tiers/entries?tier=1&limit=50").json()
+        assert len(hot) == 20 and all(e["agent_id"] == "a" for e in hot)
+
     def test_an_adapter_that_cannot_page_is_listed_whole(self, monkeypatch):
         rows = _tier_rows(60)
 
