@@ -2576,43 +2576,126 @@ async def list_entries(
     return {"entries": payload, "total": total}
 
 
+#: The most entity summaries one page may ask for.
+_ENTITY_SUMMARIES_PAGE_MAX = 500
+_ENTITY_SUMMARY_SORTS = (
+    "last_updated",
+    "entry_count",
+    "total_recalls",
+    "avg_confidence",
+    "avg_confidence_asc",
+    "entity_path",
+)
+
+
 @app.get("/api/v1/entities")
 async def list_entity_summaries(
     request: Request,
+    q: str | None = Query(None, max_length=500),
+    agent: str | None = Query(None, max_length=200),
+    min_confidence: float | None = Query(None, ge=0.0, le=1.0),
+    sort: str = Query("last_updated"),
+    limit: int | None = Query(None, ge=1, le=_ENTITY_SUMMARIES_PAGE_MAX),
+    offset: int = Query(0, ge=0),
     _auth: str | None = Depends(verify_api_key),
 ) -> dict[str, Any]:
     """Per-entity aggregates without entry values — a few KB instead of the
-    multi-MB /entries payload. Dashboards should prefer this endpoint."""
+    multi-MB /entries payload. Dashboards should prefer this endpoint.
+
+    With ``limit`` the response is one page of paths containing ``q`` that
+    ``agent`` has written to and whose mean confidence reaches
+    ``min_confidence``, ordered by ``sort`` (``last_updated``,
+    ``entry_count``, ``total_recalls``, ``avg_confidence``,
+    ``avg_confidence_asc``, ``entity_path``), and carries ``total``, the
+    count before paging. Filtering and paging happen in SQL alongside the
+    visibility predicate; an adapter without those parameters, or a
+    visibility rule that has to run over loaded entries, is filtered and
+    paged here after the fact.
+    """
     mem = _get_memory()
     adapter = mem._adapter
+    if sort not in _ENTITY_SUMMARY_SORTS:
+        raise HTTPException(status_code=400, detail=f"unknown sort {sort!r}")
 
     scope, py_vis = _visibility_scope(request)
+    narrowed = (
+        bool(q) or bool(agent) or min_confidence is not None
+        or limit is not None or sort != "last_updated"
+    )
 
-    def _summaries() -> list[dict[str, Any]]:
+    def _page_here(rows: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], int | None]:
+        """Filter, order and page rows that came back whole."""
+        if q:
+            needle = q.lower()
+            rows = [r for r in rows if needle in str(r.get("entity_path", "")).lower()]
+        if agent:
+            rows = [r for r in rows if agent in (r.get("agents") or [])]
+        if min_confidence is not None:
+            rows = [r for r in rows if float(r.get("avg_confidence") or 0) >= min_confidence]
+        if sort == "entity_path":
+            rows.sort(key=lambda r: str(r.get("entity_path", "")))
+        elif sort == "avg_confidence_asc":
+            rows.sort(key=lambda r: (r.get("avg_confidence") or 0, str(r.get("entity_path", ""))))
+        elif sort != "last_updated":
+            rows.sort(key=lambda r: (-(r.get(sort) or 0), str(r.get("entity_path", ""))))
+        if limit is None:
+            return rows, None
+        return rows[offset:offset + limit], len(rows)
+
+    def _summaries() -> tuple[list[dict[str, Any]], int | None]:
         """Off the event loop: one GROUP BY where the adapter and the
-        visibility rule allow it, a load-and-reduce otherwise."""
+        visibility rule allow it, a load-and-reduce otherwise. Returns the
+        rows and, when paged, the count before paging."""
         if py_vis is None:
-            try:
-                # The visibility rule travels into the GROUP BY as a
-                # predicate, so a per-user dashboard gets the same one query
-                # an admin does. Only passed when there is one: the ABC's
-                # default implementation does not take it.
-                if scope is None:
-                    return adapter.entity_summaries()
-                return adapter.entity_summaries(scope=scope)
-            except TypeError:
-                # An adapter without SQL scoping; reduce over its rows.
-                pass
+            # The visibility rule travels into the GROUP BY as a predicate,
+            # so a per-user dashboard gets the same one query an admin does.
+            # Only passed when there is one: the ABC's default implementation
+            # does not take it. Searched and paged in SQL first; an adapter
+            # without those parameters returns the whole list and is paged
+            # here.
+            kwargs: dict[str, Any] = {}
+            if scope is not None:
+                kwargs["scope"] = scope
+            paged = {
+                **kwargs,
+                "q": q or None,
+                "agent": agent or None,
+                "min_confidence": min_confidence,
+                "sort": sort,
+                "limit": limit,
+                "offset": offset,
+            }
+            for attempt in ([paged, kwargs] if narrowed else [kwargs]):
+                try:
+                    rows = adapter.entity_summaries(**attempt)
+                except TypeError:
+                    continue
+                if attempt is not paged:
+                    return _page_here(rows)  # the whole list, from an older adapter
+                if limit is None:
+                    return rows, None  # searched and ordered in SQL, unpaged
+                total = int(rows[0].pop("total", 0)) if rows else 0
+                for r in rows[1:]:
+                    r.pop("total", None)
+                if not rows and offset:
+                    # A page past the end says nothing about the count; the
+                    # first page does.
+                    first = adapter.entity_summaries(**{**paged, "limit": 1, "offset": 0})
+                    total = int(first[0].get("total", 0)) if first else 0
+                return rows, total
         from amfs_core.aggregates import entity_summaries_from_entries
 
         entries = mem.list()
         vis = py_vis if py_vis is not None else _active_visibility_filter(request)
         if vis is not None:
             entries = vis.filter_entries(entries)
-        return entity_summaries_from_entries(entries)
+        return _page_here(entity_summaries_from_entries(entries))
 
-    summaries = await _offload(_db_executor, _summaries)
-    return json.loads(json.dumps({"entities": summaries}, default=str))
+    summaries, total = await _offload(_db_executor, _summaries)
+    out: dict[str, Any] = {"entities": summaries}
+    if limit is not None:
+        out.update({"total": total, "limit": limit, "offset": offset})
+    return json.loads(json.dumps(out, default=str))
 
 
 @app.post("/api/v1/aggregate")
@@ -3940,8 +4023,18 @@ async def retrieve_entries(
 @app.get("/api/v1/stats")
 async def get_stats(
     request: Request,
+    breakdown: bool = True,
     _auth: str | None = Depends(verify_api_key),
 ) -> dict[str, Any]:
+    """Aggregate stats for the account.
+
+    ``breakdown=false`` leaves out the per-agent and per-entity count maps
+    (``agents``, ``entities``), which on a large account are most of the
+    response; ``total_agents``, ``total_entities`` and the
+    ``entity_confidence`` buckets stay, on every route to this answer — the
+    SQL aggregate and the loaded-and-filtered one alike. A dashboard hero
+    wants the totals; the health page wants the buckets.
+    """
     mem = _get_memory()
 
     scope, py_vis = _visibility_scope(request)
@@ -3954,15 +4047,24 @@ async def get_stats(
         "oldest_entry" vs "oldest_entry_at") is dropped to None. Both scoped
         routes below produce the same keys as the unscoped aggregate."""
         if py_vis is None:
-            try:
-                # The visibility rule as a predicate in the aggregate: a
-                # per-user dashboard gets the same query an admin does. Only
-                # passed when there is one; the ABC default takes no scope.
-                if scope is None:
-                    return mem._adapter.stats_extended()
-                return mem._adapter.stats_extended(scope=scope)
-            except TypeError:
-                pass  # an adapter without SQL scoping; reduce over its rows
+            # The visibility rule as a predicate in the aggregate: a
+            # per-user dashboard gets the same query an admin does. Only
+            # passed when there is one; the ABC default takes no scope.
+            kwargs: dict[str, Any] = {}
+            if scope is not None:
+                kwargs["scope"] = scope
+            # Without the maps first; then as the adapter knows the call. An
+            # adapter that takes neither keyword reduces over its rows below.
+            attempts = [kwargs] if breakdown else [{**kwargs, "breakdown": False}, kwargs]
+            for attempt in attempts:
+                try:
+                    stats = mem._adapter.stats_extended(**attempt)
+                except TypeError:
+                    continue
+                if not breakdown:
+                    stats.pop("agents", None)
+                    stats.pop("entities", None)
+                return stats
         # A filter that can only run over loaded entries: load, filter,
         # aggregate with the same shared helper the adapter defaults use.
         from amfs_core.aggregates import extended_stats_from_entries
@@ -3971,7 +4073,11 @@ async def get_stats(
         vis = py_vis if py_vis is not None else _active_visibility_filter(request)
         if vis is not None:
             entries = vis.filter_entries(entries)
-        return extended_stats_from_entries(entries)
+        stats = extended_stats_from_entries(entries)
+        if not breakdown:
+            stats.pop("agents", None)
+            stats.pop("entities", None)
+        return stats
 
     stats = await _offload(_db_executor, _stats)
     return json.loads(json.dumps(stats, default=str))
@@ -6572,10 +6678,19 @@ def upsert_graph_edge_endpoint(
 # ──────────────────────────────────────────────────────────────────────
 
 
+#: The most enriched agents one page may ask for.
+_ENRICHED_AGENTS_PAGE_MAX = 500
+
+
 @app.get("/api/v1/agents/enriched")
 def list_agents_enriched(
     request: Request,
     histograms: bool = True,
+    q: str | None = Query(None, max_length=200),
+    platform: str | None = Query(None, max_length=100),
+    sort: str = Query("last_active"),
+    limit: int | None = Query(None, ge=1, le=_ENRICHED_AGENTS_PAGE_MAX),
+    offset: int = Query(0, ge=0),
     _auth: str | None = Depends(verify_api_key),
 ) -> dict[str, Any]:
     """Return enriched agent info with activity histograms.
@@ -6583,15 +6698,58 @@ def list_agents_enriched(
     Pass histograms=false to skip the per-agent activity histogram queries —
     summary consumers (e.g. the dashboard overview's agent count) only need
     the roster, and the histograms cost up to 100 extra queries per call.
+
+    With ``limit`` the response is one page, searched by ``q``, kept to one
+    ``platform`` and ordered by ``sort`` (``last_active``,
+    ``entries_written``, ``created_at``, ``agent_id``), and carries
+    ``total`` — the number of agents the caller may see that match — and
+    ``active_7d``, how many of those were active in the last seven days.
+    Paging and visibility both happen in SQL, so a page is a page of visible
+    agents; an adapter without those parameters is filtered here, unpaged,
+    as before. Without ``limit`` the whole roster is returned, 3 MB on a
+    6,000-agent account — a directory should page.
     """
     mem = _get_memory()
-    agents = mem._adapter.list_agents_enriched(namespace=mem.namespace)
     allowed = _visible_agent_ids(request)
-    if allowed is not None:
-        agents = [
-            a for a in agents
-            if (a.get("agent_id") or a.get("agentId", "")) in allowed
-        ]
+    paged = limit is not None
+    narrowing: dict[str, Any] = {
+        "agent_ids": sorted(allowed) if allowed is not None else None,
+        "q": q or None,
+        "platform": platform or None,
+        "sort": sort,
+    }
+    try:
+        agents = mem._adapter.list_agents_enriched(
+            namespace=mem.namespace, limit=limit, offset=offset, **narrowing,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except TypeError:
+        # An adapter without search or paging: the visibility rule runs here
+        # and the roster is whole.
+        paged = False
+        agents = mem._adapter.list_agents_enriched(namespace=mem.namespace)
+        if allowed is not None:
+            agents = [
+                a for a in agents
+                if (a.get("agent_id") or a.get("agentId", "")) in allowed
+            ]
+    total: int | None = None
+    active_7d: int | None = None
+    if paged:
+        total = int(agents[0].pop("total", 0)) if agents else 0
+        active_7d = int(agents[0].pop("active_7d", 0)) if agents else 0
+        for agent in agents[1:]:
+            agent.pop("total", None)
+            agent.pop("active_7d", None)
+        if not agents and offset:
+            # A page past the end says nothing about the count; the first
+            # page does.
+            first = mem._adapter.list_agents_enriched(
+                namespace=mem.namespace, limit=1, offset=0, **narrowing,
+            )
+            total = int(first[0].get("total", 0)) if first else 0
+            active_7d = int(first[0].get("active_7d", 0)) if first else 0
     if histograms:
         for agent in agents[:100]:
             aid = agent.get("agent_id") or agent.get("agentId", "")
@@ -6599,7 +6757,12 @@ def list_agents_enriched(
                 agent["activity_histogram"] = mem._adapter.get_agent_activity_histogram(
                     aid, days=7, namespace=mem.namespace,
                 )
-    return {"agents": agents}
+    out: dict[str, Any] = {"agents": agents}
+    if paged:
+        out.update({
+            "total": total, "active_7d": active_7d, "limit": limit, "offset": offset,
+        })
+    return out
 
 
 @app.get("/api/v1/agent-groups")
@@ -6838,17 +7001,45 @@ def dismiss_cluster_suggestion_endpoint(
 
 
 # The cluster compile walks every agent in the namespace and is pure Python
-# CPU — minutes on an account with thousands of agents. The dashboard's Agents
-# page POSTs it on every mount, so without a guard two tabs or one reload queue
-# a second full compile behind the first while the process is pinned at one
-# core. One compile at a time per process, and a compile that finished within
-# the window is reused rather than repeated; the caller's ``ok`` is unchanged
-# because it only ever waited for the suggestions to be refreshed.
+# CPU. The dashboard's Agents page POSTs it on every mount, so without a guard
+# two tabs or one reload queue a second compile behind the first. One compile
+# at a time per process, in the background; a compile that finished within the
+# window — on any instance, read from the stored digest — is reused rather
+# than repeated. The per-process timestamp is the fallback for an adapter
+# that cannot say when the digest was compiled.
 _CLUSTER_RECOMPUTE_MIN_INTERVAL_S = float(
     os.environ.get("AMFS_CLUSTER_RECOMPUTE_MIN_INTERVAL_S", "300"),
 )
 _cluster_recompute_lock = threading.Lock()
 _cluster_recompute_last: dict[str, float] = {}
+_cluster_recompute_inflight: set[str] = set()
+
+
+def _cluster_digest_compiled_at(adapter: Any, namespace: str) -> datetime | None:
+    """When this account's cluster digest was last compiled, or None."""
+    get = getattr(adapter, "get_digest", None)
+    if not callable(get):
+        return None
+    try:
+        from amfs_core.models import DigestType
+
+        digest = get(DigestType.AGENT_CLUSTERS, f"account:{namespace}", namespace=namespace)
+    except Exception:  # noqa: BLE001 - a failed lookup means "unknown", not "fresh"
+        logger.debug("Cluster digest lookup failed", exc_info=True)
+        return None
+    return getattr(digest, "compiled_at", None) if digest is not None else None
+
+
+def _cluster_compile_is_fresh(adapter: Any, namespace: str, window_key: str) -> bool:
+    """Whether a compile finished inside the reuse window, on any instance."""
+    compiled_at = _cluster_digest_compiled_at(adapter, namespace)
+    if compiled_at is not None:
+        if compiled_at.tzinfo is None:
+            compiled_at = compiled_at.replace(tzinfo=UTC)
+        age = (datetime.now(UTC) - compiled_at).total_seconds()
+        return age < _CLUSTER_RECOMPUTE_MIN_INTERVAL_S
+    last = _cluster_recompute_last.get(window_key)
+    return last is not None and time.monotonic() - last < _CLUSTER_RECOMPUTE_MIN_INTERVAL_S
 
 
 def _recompute_window_key(request: Request, namespace: str) -> str:
@@ -6882,13 +7073,16 @@ def recompute_clusters(
     force: bool = False,
     _auth: str | None = Depends(verify_api_key),
 ) -> dict[str, Any]:
-    """Trigger recomputation of agent clusters.
+    """Schedule a recomputation of agent clusters and return.
 
-    Runs on the threadpool (plain ``def``): the compile is CPU-bound Python and
-    used to freeze the event loop for its whole duration. ``force=true`` skips
-    the reuse window but still waits its turn behind a compile in flight. The
-    window is per tenant account; the lock is per process, because the compile
-    is what pins the core.
+    The caller reads the result through ``/agent-groups/suggestions``, which
+    is what it did after waiting here before; the compile is CPU-bound Python
+    that ran inside this request for minutes on a large account, with the
+    Agents page POSTing it on every mount. The reuse window is the stored
+    digest's ``compiled_at``, so it holds across every instance serving the
+    account — a per-process window let each of twelve instances compile the
+    same account once. ``force=true`` skips the window but still yields to a
+    compile in flight in this process.
     """
     try:
         from amfs_cortex.compiler import DigestCompiler
@@ -6908,16 +7102,27 @@ def recompute_clusters(
     ns = mem.namespace
     window_key = _recompute_window_key(request, ns)
     with _cluster_recompute_lock:
-        last = _cluster_recompute_last.get(window_key)
-        if (
-            not force
-            and last is not None
-            and time.monotonic() - last < _CLUSTER_RECOMPUTE_MIN_INTERVAL_S
-        ):
+        if window_key in _cluster_recompute_inflight:
+            return {"ok": True, "skipped": "in_progress"}
+        if not force and _cluster_compile_is_fresh(adapter, ns, window_key):
             return {"ok": True, "skipped": "recent"}
-        DigestCompiler(adapter=adapter, namespace=ns).compile(f"cluster:account:{ns}")
-        _cluster_recompute_last[window_key] = time.monotonic()
-    return {"ok": True}
+        _cluster_recompute_inflight.add(window_key)
+
+    def _compile() -> None:
+        try:
+            DigestCompiler(adapter=adapter, namespace=ns).compile(f"cluster:account:{ns}")
+            with _cluster_recompute_lock:
+                _cluster_recompute_last[window_key] = time.monotonic()
+        except Exception:
+            logger.exception("Agent cluster compile failed for %s", window_key)
+        finally:
+            with _cluster_recompute_lock:
+                _cluster_recompute_inflight.discard(window_key)
+
+    # The copied context carries the request's tenant into the thread, the
+    # way every other background write here does.
+    _bg_executor.submit(contextvars.copy_context().run, _compile)
+    return {"ok": True, "scheduled": True}
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -9005,9 +9210,20 @@ def list_cortex_digests(
     request: Request,
     digest_type: str | None = Query(None),
     scope: str | None = Query(None),
+    written_by: str | None = Query(None, max_length=200),
+    limit: int | None = Query(None, ge=1, le=500),
     _auth: str | None = Depends(verify_api_key),
 ) -> dict[str, Any]:
-    """List compiled digests, optionally filtered by type and scope."""
+    """List compiled digests, optionally filtered by type and scope.
+
+    The filters and ``limit`` (most recently compiled first) apply in SQL: a
+    page asking for one agent's brief gets that brief, not every brief on the
+    account to pick its own out of. ``written_by`` keeps the digests whose
+    scope is an entity that agent has written to — an agent page's "briefed
+    with" list without every entity digest on the account. A restricted
+    caller's visibility is applied after, so with ``limit`` such a caller may
+    receive fewer.
+    """
     try:
         from amfs_postgres.adapter import PostgresAdapter
         from amfs_core.models import DigestType
@@ -9017,9 +9233,13 @@ def list_cortex_digests(
         if isinstance(adapter, PostgresAdapter):
             dt = DigestType(digest_type) if digest_type else None
             namespace = getattr(adapter, "_namespace", "default")
-            digests = adapter.list_digests(digest_type=dt, namespace=namespace)
-            if scope:
-                digests = [d for d in digests if d.scope == scope]
+            digests = adapter.list_digests(
+                digest_type=dt,
+                namespace=namespace,
+                scope=scope or None,
+                written_by=written_by or None,
+                limit=limit,
+            )
 
             vis = _get_visibility_filter(request)
             if vis is not None and vis.should_filter():
@@ -9229,6 +9449,46 @@ def list_consolidation_proposals(
     }
 
 
+_CONSOLIDATION_READY_MIN_ENTRIES = 10
+_CONSOLIDATION_READY_LIMIT = 10
+
+
+def _consolidation_ready_entities(request: Request, adapter: Any) -> list[str]:
+    """Entity paths with enough entries to consolidate, largest first.
+
+    One GROUP BY where the adapter has it and the caller's visibility is a
+    SQL predicate (or absent); otherwise the rule runs over loaded entries,
+    which is the only correct answer for a filter SQL cannot express.
+    """
+    ready = getattr(adapter, "consolidation_ready_entities", None)
+    scope, py_vis = _visibility_scope(request)
+    if callable(ready) and py_vis is None:
+        try:
+            kwargs: dict[str, Any] = {
+                "min_entries": _CONSOLIDATION_READY_MIN_ENTRIES,
+                "limit": _CONSOLIDATION_READY_LIMIT,
+            }
+            if scope is not None:
+                kwargs["scope"] = scope
+            return list(ready(**kwargs))
+        except TypeError:
+            pass  # an adapter without SQL scoping; reduce over its rows
+    entries = adapter.list()
+    vis = py_vis if py_vis is not None else _active_visibility_filter(request)
+    if vis is not None:
+        entries = vis.filter_entries(entries)
+    entity_counts: dict[str, int] = {}
+    for e in entries:
+        entity_counts[e.entity_path] = entity_counts.get(e.entity_path, 0) + 1
+    out: list[str] = []
+    for ep, count in sorted(entity_counts.items(), key=lambda x: (-x[1], x[0])):
+        if count >= _CONSOLIDATION_READY_MIN_ENTRIES:
+            out.append(ep)
+        if len(out) >= _CONSOLIDATION_READY_LIMIT:
+            break
+    return out
+
+
 @app.get("/api/v1/cortex/consolidation/status")
 def consolidation_status(
     request: Request,
@@ -9265,17 +9525,7 @@ def consolidation_status(
 
     entities_ready: list[str] = []
     try:
-        entries = adapter.list()
-        if vis is not None:
-            entries = vis.filter_entries(entries)
-        entity_counts: dict[str, int] = {}
-        for e in entries:
-            entity_counts[e.entity_path] = entity_counts.get(e.entity_path, 0) + 1
-        for ep, count in sorted(entity_counts.items(), key=lambda x: -x[1]):
-            if count >= 10:
-                entities_ready.append(ep)
-            if len(entities_ready) >= 10:
-                break
+        entities_ready = _consolidation_ready_entities(request, adapter)
     except Exception:
         pass
 
