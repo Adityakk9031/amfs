@@ -8711,29 +8711,132 @@ def graph_backfill(
 # ──────────────────────────────────────────────────────────────────────
 
 
-def _compute_tiers(entries: list) -> tuple[dict[str, int], dict[str, float]]:
-    """Score entries and assign HMO tiers (Hot/Warm/Archive)."""
-    from amfs_core.tiering import PriorityScorer, TierAssigner
+def _tier_bands() -> tuple[int, int]:
+    """``(hot_capacity, warm_capacity)``: the tiers are rank bands over the
+    priority order — the top ``hot`` entries are Hot, the next ``warm`` Warm,
+    the rest Archive (``amfs_core.tiering.TierAssigner``)."""
+    from amfs_core.models import TierConfig
+
+    cfg = TierConfig()
+    return int(cfg.hot_capacity), int(cfg.warm_capacity)
+
+
+def _tier_split(total: int) -> tuple[int, int, int]:
+    """How many of *total* ranked entries fall in each band."""
+    hot_cap, warm_cap = _tier_bands()
+    hot = min(hot_cap, total)
+    warm = min(warm_cap, max(0, total - hot_cap))
+    return hot, warm, max(0, total - hot_cap - warm_cap)
+
+
+def _tier_window(tier: int, limit: int) -> tuple[int, int]:
+    """``(offset, limit)`` into the priority ranking for one tier's page."""
+    hot_cap, warm_cap = _tier_bands()
+    if tier == 1:
+        return 0, min(limit, hot_cap)
+    if tier == 2:
+        return hot_cap, min(limit, warm_cap)
+    return hot_cap + warm_cap, limit
+
+
+#: Entries per round trip when the tiers have to be scored in Python.
+_TIER_SCAN_PAGE = 2000
+
+
+def _tier_scan(
+    mem: AgentMemory,
+    agent_id: str | None,
+    *,
+    scope: Any | None,
+    py_filter: Any | None,
+    vis: Any | None,
+    keep: int,
+) -> tuple[int, float, list[tuple[float, MemoryEntry]]]:
+    """Score the visible entries a page at a time, keeping only the top *keep*.
+
+    The fallback for a visibility rule that only exists in Python or an
+    adapter that cannot order by the score. Bounded in memory: a page is
+    scored, folded into the count and the running sum, and all but the top
+    *keep* are dropped before the next page is read.
+
+    The caller's visibility is ``(scope, py_filter)`` as ``_visibility_scope``
+    gave it: *scope* narrows each page in SQL, *py_filter* runs over the
+    loaded rows. An adapter that cannot take a scope or page (the in-memory
+    ones) gets one unpaged ``list()``, and then *vis* — the filter object the
+    scope was derived from — runs over it, so a rule that exists only as a
+    predicate is still applied rather than dropped. Returns
+    ``(count, score_sum, top)`` with *top* highest first. Synchronous: call
+    it via ``_offload``.
+    """
+    import heapq
+
+    from amfs_core.tiering import PriorityScorer
 
     scorer = PriorityScorer()
-    assigner = TierAssigner()
-    return assigner.assign_with_scores(entries, scorer)
+    now = datetime.now(UTC)
+    count = 0
+    score_sum = 0.0
+    # A min-heap of (score, tiebreak, entry); the smallest is evicted first.
+    top: list[tuple[float, int, MemoryEntry]] = []
+    seq = 0
+
+    def fold(entries: list[MemoryEntry], rule: Any | None) -> None:
+        nonlocal count, score_sum, seq
+        if rule is not None:
+            entries = rule.filter_entries(entries)
+        for e in entries:
+            if agent_id and e.provenance.agent_id != agent_id:
+                continue
+            s = scorer.score(e, now=now)
+            count += 1
+            score_sum += s
+            seq -= 1  # earlier rows win ties, as the stable sort did
+            item = (s, seq, e)
+            if len(top) < keep:
+                heapq.heappush(top, item)
+            elif item > top[0]:
+                heapq.heapreplace(top, item)
+
+    offset = 0
+    adapter = mem._adapter
+    while True:
+        try:
+            page = adapter.list(
+                agent_id=agent_id, scope=scope, limit=_TIER_SCAN_PAGE, offset=offset
+            )
+        except TypeError:
+            # No scope or paging in this adapter: the whole account, and the
+            # visibility rule — whichever form it took — applied here.
+            rule = py_filter if py_filter is not None else (vis if scope is not None else None)
+            fold(_entries_by_agent(mem, agent_id) if agent_id else mem.list(), rule)
+            break
+        fold(page, py_filter)
+        if len(page) < _TIER_SCAN_PAGE:
+            break
+        offset += _TIER_SCAN_PAGE
+    ranked = sorted(top, reverse=True)
+    return count, score_sum, [(s, e) for s, _, e in ranked]
 
 
-def _tiered_entries(
-    mem: AgentMemory, vis: Any | None, agent_id: str | None
-) -> tuple[list[MemoryEntry], tuple[dict[str, int], dict[str, float]]]:
-    """The entries a tiers page scores, and their tiers and scores.
+def _tiers_in_sql(adapter: Any, py_filter: Any | None) -> bool:
+    """Whether the tiers can be read as one ranked page from the database:
+    the adapter orders by the score and no Python-only visibility rule hides
+    an unknown share of the rows."""
+    return py_filter is None and callable(getattr(adapter, "list_by_priority", None))
 
-    The tiering is a Python scorer over the whole visible set, so the set has
-    to be loaded; this loads only the named agent's rows when there is one
-    and runs the load, the visibility pass and the scoring together off the
-    event loop. Synchronous: call it via ``_offload``.
-    """
-    entries = _entries_by_agent(mem, agent_id) if agent_id else mem.list()
-    if vis is not None:
-        entries = vis.filter_entries(entries)
-    return entries, _compute_tiers(entries)
+
+def _tier_entry_dict(e: MemoryEntry, tier: int, score: float) -> dict[str, Any]:
+    return {
+        "entity_path": e.entity_path,
+        "key": e.key,
+        "confidence": e.confidence,
+        "tier": tier,
+        "priority_score": round(score, 6),
+        "recall_count": getattr(e, "recall_count", 0),
+        "importance_score": getattr(e, "importance_score", None),
+        "written_at": e.provenance.written_at.isoformat(),
+        "agent_id": e.provenance.agent_id,
+    }
 
 
 @app.get("/api/v1/pro/tiers/distribution")
@@ -8742,32 +8845,36 @@ async def tiers_distribution(
     agent_id: str | None = Query(None),
     _auth: str | None = Depends(verify_api_key),
 ) -> dict[str, Any]:
-    """Return HMO tier distribution (Hot / Warm / Archive)."""
-    entries, (tiers, scores) = await _offload(
-        _db_executor, _tiered_entries, _get_memory(), _active_visibility_filter(request), agent_id
-    )
+    """Return HMO tier distribution (Hot / Warm / Archive).
 
-    hot = warm = archive = scored_count = 0
-    score_sum = 0.0
-    for key, tier in tiers.items():
-        if tier == 1:
-            hot += 1
-        elif tier == 2:
-            warm += 1
-        else:
-            archive += 1
-        s = scores.get(key)
-        if s is not None:
-            scored_count += 1
-            score_sum += s
+    The tiers are rank bands over the priority score, so the distribution is
+    a count and a mean: the database computes both (``priority_stats``) and
+    no entry is loaded. The previous version listed the whole account and
+    scored it in Python; on a 420K-entry account the two requests the tiers
+    page makes together exhausted an 8 GiB instance and took every other
+    request on it down with them.
+    """
+    mem = _get_memory()
+    scope, py_filter = _visibility_scope(request)
+    if _tiers_in_sql(mem._adapter, py_filter):
+        total, mean = await _offload(
+            _db_executor, mem._adapter.priority_stats, scope=scope, agent_id=agent_id
+        )
+    else:
+        total, score_sum, _top = await _offload(
+            _db_executor, _tier_scan, mem, agent_id,
+            scope=scope, py_filter=py_filter, vis=_active_visibility_filter(request), keep=1,
+        )
+        mean = score_sum / total if total else None
 
+    hot, warm, archive = _tier_split(total)
     return {
-        "total": len(entries),
+        "total": total,
         "hot": hot,
         "warm": warm,
         "archive": archive,
-        "scored": scored_count,
-        "avg_priority_score": round(score_sum / scored_count, 6) if scored_count else None,
+        "scored": total,
+        "avg_priority_score": round(mean, 6) if mean is not None else None,
     }
 
 
@@ -8779,28 +8886,28 @@ async def tiers_entries(
     agent_id: str | None = Query(None),
     _auth: str | None = Depends(verify_api_key),
 ) -> list[dict[str, Any]]:
-    """Return entries for a given HMO tier as a flat array."""
-    entries, (tier_map, score_map) = await _offload(
-        _db_executor, _tiered_entries, _get_memory(), _active_visibility_filter(request), agent_id
+    """Return entries for a given HMO tier as a flat array, highest priority
+    first. One page of the ranking, read at the tier's offset."""
+    mem = _get_memory()
+    scope, py_filter = _visibility_scope(request)
+    offset, page = _tier_window(tier, limit)
+    if _tiers_in_sql(mem._adapter, py_filter):
+        from amfs_core.tiering import PriorityScorer
+
+        now = datetime.now(UTC)
+        entries = await _offload(
+            _db_executor, mem._adapter.list_by_priority,
+            scope=scope, agent_id=agent_id, limit=page, offset=offset, now=now,
+        )
+        scorer = PriorityScorer()
+        return [_tier_entry_dict(e, tier, scorer.score(e, now=now)) for e in entries]
+
+    _count, _sum, top = await _offload(
+        _db_executor, _tier_scan, mem, agent_id,
+        scope=scope, py_filter=py_filter, vis=_active_visibility_filter(request),
+        keep=offset + page,
     )
-
-    filtered = [e for e in entries if tier_map.get(e.entry_key) == tier]
-    filtered.sort(key=lambda e: score_map.get(e.entry_key, 0.0), reverse=True)
-
-    return [
-        {
-            "entity_path": e.entity_path,
-            "key": e.key,
-            "confidence": e.confidence,
-            "tier": tier,
-            "priority_score": round(score_map.get(e.entry_key, 0.0), 6),
-            "recall_count": getattr(e, "recall_count", 0),
-            "importance_score": getattr(e, "importance_score", None),
-            "written_at": e.provenance.written_at.isoformat(),
-            "agent_id": e.provenance.agent_id,
-        }
-        for e in filtered[:limit]
-    ]
+    return [_tier_entry_dict(e, tier, s) for s, e in top[offset:offset + page]]
 
 
 # ──────────────────────────────────────────────────────────────────────

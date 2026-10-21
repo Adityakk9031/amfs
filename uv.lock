@@ -8,6 +8,10 @@ resolution-markers = [
     "python_full_version < '3.12'",
 ]
 
+[options]
+exclude-newer = "2026-10-19T07:13:30.124444Z"
+exclude-newer-span = "P2D"
+
 [manifest]
 members = [
     "amfs",
@@ -231,7 +235,7 @@ requires-dist = [
 
 [[package]]
 name = "amfs-adapter-postgres"
-version = "0.2.41"
+version = "0.2.42"
 source = { editable = "packages/adapters/postgres" }
 dependencies = [
     { name = "amfs-core" },
@@ -395,7 +399,7 @@ provides-extras = ["crewai"]
 
 [[package]]
 name = "amfs-http-server"
-version = "0.3.62"
+version = "0.3.63"
 source = { editable = "packages/http-server" }
 dependencies = [
     { name = "amfs" },
