@@ -24,6 +24,7 @@ from __future__ import annotations
 import hashlib
 import math
 import re
+from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Iterable, Mapping, Sequence
@@ -630,18 +631,25 @@ def split_contested(
             for threshold in values[1:]:
                 candidates.append((">=", threshold))
                 candidates.append(("<", threshold))
-        # A categorical key whose values hardly repeat is an identifier (a
-        # ticket number, an email, a client's own id), not a covariate: the
-        # values the losses carry would "explain" every loss with no
-        # exception. A covariate's values recur over the record, the takes
-        # before the contest included; three distinct values in four
-        # observations do not. (A numeric id that runs with time makes a
-        # clean turn, which the win-since requirement below already refuses.)
+        # A categorical key whose values hardly ever repeat is an identifier
+        # (a ticket number, an email, a client's own id), not a covariate:
+        # the values the losses carry would "explain" every loss with no
+        # exception. The test is on the values, not the observations: an
+        # identifier's values are nearly all singletons however long the
+        # record (a returning customer is one repeat in twenty), while a
+        # covariate's repeat — a plan on three values over the minimum
+        # contest of two losses and two wins has one value twice, and that
+        # repeat is what tells it from an id. Over three-quarters of the
+        # values seen once refuses the split. (A numeric id that runs with
+        # time makes a clean turn, which the win-since requirement below
+        # already refuses.)
         fails = [
             v for v in values
             if sum(1 for x, ok in have if x == v and not ok) > sum(1 for x, ok in have if x == v and ok)
         ]
-        identifier = len(values) * 4 >= (len(have) + len(earlier)) * 3
+        seen = Counter([v for v, _ in have] + [v for v, _ in earlier])
+        singletons = sum(1 for v in values if seen[v] == 1)
+        identifier = singletons * 4 > len(values) * 3
         if fails and len(fails) < len(values) and not identifier:
             candidates.append(("in", fails))
         for op, arg in candidates:
@@ -1994,6 +2002,12 @@ def rank_by_lessons(
         (worked if claim.get("worked") else failed).add(action)
     failed -= worked
     worked = {a for a in worked if not (a in tried and _stopped_working(tried[a]))}
+    # The same for the action a contest is about: its record on this
+    # situation is split, and a lesson that it worked here was written on
+    # one side of the split. The record is newer than the lesson's words.
+    contest = (recommendation or {}).get("contested")
+    contested_action = str(contest.get("action") or "") if isinstance(contest, Mapping) else ""
+    worked.discard(contested_action)
     if not worked and not failed:
         return order
     head: list[str] = []
@@ -2001,6 +2015,15 @@ def rank_by_lessons(
     suggested = str((recommendation or {}).get("suggested_action") or "")
     if mode == "act" and suggested in order and suggested not in failed:
         head.append(suggested)
+    elif mode == "conditional":
+        # The plan opened with the rule's branches (:func:`plan_actions`);
+        # what won on the failing side stays at the head the way an ``act``
+        # recommendation does, since that is the side the record is
+        # contested on.
+        rule = (recommendation or {}).get("rule")
+        then = str(rule.get("then") or "") if isinstance(rule, Mapping) else ""
+        if then and then in order and then not in failed:
+            head.append(then)
     front = [a for a in order if a in worked and a not in head]
     back = [a for a in order if a in failed]
     middle = [a for a in order if a not in head and a not in worked and a not in failed]

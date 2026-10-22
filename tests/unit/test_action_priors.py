@@ -2876,3 +2876,70 @@ def test_a_conditional_plan_opens_with_the_rules_branches_not_the_stale_record()
     open_ = act.recommend(pr2, agent_id="a", candidate_actions=cands)
     assert open_["mode"] == "conditional" and open_["rule"]["then"] is None
     assert open_["plan"][0] in (new, "resolve:refund") and open_["plan"].index(old) == 2
+
+
+def test_a_worked_lesson_about_the_contested_action_does_not_unseat_the_rules_branch() -> None:
+    """``rank_by_lessons`` moves an action a situation-exact lesson says
+    worked to the front — but the contested action's record is split, and
+    the lesson was written on one side of it (Bugbot on #494). The record is
+    newer than the lesson's words: the rule's failing-side winner keeps the
+    head under ``conditional`` the way ``suggested_action`` does under
+    ``act``, and the contested action is not moved up in any mode."""
+    rows = _set_c_export_record()
+    old, new = "resolve:advise_workaround", "resolve:advise_settings_change"
+    cands = [old, new, "resolve:refund"]
+    pr = act.aggregate_priors(rows, candidate_actions=cands, situation_exact=True)
+    pr["situation_record"] = {"situation": "export timeout", "outcomes": len(rows)}
+    stale = [{"action": old, "worked": True, "evidence_status": "validated"}]
+
+    unknown = act.recommend(pr, agent_id="a", candidate_actions=cands)
+    assert unknown["mode"] == "conditional" and unknown["plan"][:2] == [new, old]
+    assert act.rank_by_lessons(unknown["plan"], stale, priors=pr, recommendation=unknown)[:2] == [new, old]
+    # A lesson against the failing-side winner still demotes it: lessons
+    # about the other actions keep their say.
+    against = [{"action": new, "worked": False, "evidence_status": "validated"}]
+    assert act.rank_by_lessons(unknown["plan"], against, priors=pr, recommendation=unknown)[-1] == new
+
+    moved = act.recommend(pr, agent_id="a", candidate_actions=cands, covariates={"plan": "team"})
+    assert moved["mode"] == "act" and moved["suggested_action"] == new
+    assert act.rank_by_lessons(moved["plan"], stale, priors=pr, recommendation=moved)[0] == new
+
+
+def test_a_three_value_plan_on_the_minimum_contest_is_a_covariate_and_an_id_is_not() -> None:
+    """The identifier guard reads the values, not the observations (Bugbot
+    on #494): two losses on pro and team against two wins on free is the
+    documented ``plan in {pro, team}`` shape and the first searches after a
+    change are exactly this thin — one value repeating is what tells a plan
+    from a ticket number, whose values are singletons however long the
+    record. Four plans over four observations repeat nothing and are not
+    split on either."""
+    old, new = "resolve:advise_workaround", "resolve:advise_settings_change"
+    thin = [
+        _cov_row(old, True, {"plan": "free", "ticket": "SUP-1"}, minutes_ago=50),
+        _cov_row(old, False, {"plan": "pro", "ticket": "SUP-2"}, minutes_ago=40, resolved_with=new),
+        _cov_row(old, True, {"plan": "free", "ticket": "SUP-3"}, minutes_ago=30),
+        _cov_row(old, False, {"plan": "team", "ticket": "SUP-4"}, minutes_ago=20, resolved_with=new),
+    ]
+    cb = act.contested_record(thin)
+    assert cb is not None and cb["rule"]["key"] == "plan" and not cb["rule"].get("alternatives")
+    assert sorted(cb["rule"]["fails_when"]) == ["pro", "team"] and cb["rule"]["works_when"] == ["free"]
+
+    no_repeat = [
+        _cov_row(old, True, {"plan": "free"}, minutes_ago=50),
+        _cov_row(old, False, {"plan": "pro"}, minutes_ago=40, resolved_with=new),
+        _cov_row(old, True, {"plan": "enterprise"}, minutes_ago=30),
+        _cov_row(old, False, {"plan": "team"}, minutes_ago=20, resolved_with=new),
+    ]
+    cb2 = act.contested_record(no_repeat)
+    assert cb2 is not None and cb2.get("rule") is None
+
+    # A long record where a customer id repeats once in twenty is still an id.
+    long_ = []
+    for i in range(20):
+        ok = i % 3 != 0 or i < 8
+        cust = "C-7" if i in (5, 17) else f"C-{i}"
+        long_.append(_cov_row(old, ok, {"plan": "pro" if not ok else ("free", "team")[i % 2], "customer": cust},
+                              minutes_ago=200 - 10 * i, resolved_with=None if ok else new))
+    cb3 = act.contested_record(long_)
+    assert cb3 is not None and cb3["rule"]["key"] == "plan"
+    assert "customer" not in {a["key"] for a in cb3["rule"].get("alternatives") or []}
