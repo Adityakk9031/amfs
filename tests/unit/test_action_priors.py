@@ -801,6 +801,59 @@ def test_commit_outcome_derives_actions_taken_and_entity_paths(mem: AgentMemory,
     assert rec.situation == "card declined"
 
 
+def test_declared_covariates_travel_as_their_own_block_apart_from_the_bags_bookkeeping(
+    mem: AgentMemory, monkeypatch
+) -> None:
+    """``Run.observe`` puts the task's covariates on the bag so a server that
+    reads only the bag still sees them — and on the record's own
+    ``covariates`` block, so the server never has to guess which bag keys
+    are covariates and which are the SDK's bookkeeping (Bugbot on #494: the
+    guidance id and count would have split every contested situation). The
+    HTTP adapter carries the block as its own field, the server's request
+    model accepts it, and the postgres write reads the declared block first."""
+    from amfs import Run
+    from amfs_adapter_http.adapter import HttpAdapter
+    from amfs_http.models import OutcomeRequest
+
+    captured = {}
+    original = mem._adapter.commit_outcome
+    monkeypatch.setattr(mem._adapter, "commit_outcome", lambda r: (captured.setdefault("r", r), original(r))[1])
+
+    run = Run(mem)
+    run.begin("export times out", entity_path="acme/support", situation="export timeout",
+              covariates={"Plan": "pro"})
+    run.observe(issuer="US", app_major=9)
+    with pytest.raises(ValueError):
+        run.observe(model="gpt-5")  # the environment is not a covariate
+    with pytest.raises(TypeError):
+        run.observe(tags=["a"])  # scalars only
+    mem.set_session_attributes({"guidance_id": "g-1", "guidance_count": 3})
+    run.complete(True)
+
+    rec = captured["r"]
+    assert rec.covariates == {"plan": "pro", "issuer": "US", "app_major": 9}
+    bag = rec.session_metadata["attributes"]
+    assert bag["plan"] == "pro" and bag["guidance_id"] == "g-1"
+    # The postgres write and the priors read use the declared block, not the bag.
+    row = {"covariates": rec.covariates, "session_metadata": rec.session_metadata}
+    assert act.recorded_covariates(row) == rec.covariates
+    assert "guidance_id" not in act.recorded_covariates({"session_metadata": rec.session_metadata})
+
+    # The adapter's body carries the block, the server's model accepts it.
+    posted = {}
+    adapter = HttpAdapter(base_url="http://x", api_key="k")
+    monkeypatch.setattr(adapter, "_post", lambda path, body, **kw: (posted.setdefault(path, body), {"entries": []})[1])
+    adapter.commit_outcome(rec)
+    body = posted["/api/v1/outcomes"]
+    assert body["covariates"] == rec.covariates
+    accepted = {k: v for k, v in body.items() if k in OutcomeRequest.model_fields}
+    assert OutcomeRequest(**accepted).covariates == rec.covariates
+
+    # The bag — and the declared block — are cleared with the commit.
+    assert mem.covariates == {}
+    assert mem.session_attributes == {}
+
+
 def test_commit_outcome_scans_the_action_key_for_secrets(mem: AgentMemory, monkeypatch) -> None:
     """When the gate blocks the derived key, the action keeps only its tool name."""
     import amfs.memory as memmod
@@ -2759,70 +2812,6 @@ def test_covariates_are_dropped_from_a_label_but_a_label_of_only_covariates_keep
     assert fold("card declined", cov) == fold("android card declined plan team", cov)
     assert fold("Android team", cov) == "android team"
     assert fold("card declined") == "card declined"
-
-
-def test_bookkeeping_and_identifiers_are_not_covariates() -> None:
-    """The SDK stamps the served guidance's id and count, the branch and the
-    verifier on the attributes bag; a unique id would split any record with
-    no exception and a counter would split it by time. Neither is a
-    covariate (Bugbot on #494). An id the client declares as a covariate —
-    a ticket number — is refused by the split itself: its values do not
-    repeat over the record."""
-    row = {"session_metadata": {"attributes": {
-        "plan": "pro", "guidance_id": "g-1", "guidance_count": 3, "memory_branch": "main",
-        "verified_by": "oracle", "entity_path": "acme/support", "situation": "export timeout",
-        "model": "beam", "Issuer": "US",
-    }}}
-    assert act.recorded_covariates(row) == {"plan": "pro", "issuer": "US"}
-    # The declared block is taken whole and the bag is not merged on top of it.
-    assert act.recorded_covariates({**row, "covariates": {"plan": "team"}}) == {"plan": "team"}
-
-    old, new = "resolve:advise_workaround", "resolve:advise_settings_change"
-    rows = []
-    for i, (ok, plan) in enumerate([(True, "team"), (True, "free"), (True, "pro"), (False, "pro"),
-                                    (True, "free"), (False, "team"), (True, "free"), (False, "pro")]):
-        rows.append(_cov_row(old, ok, {"plan": plan, "ticket": f"SUP-{1000 + i}"}, minutes_ago=90 - 10 * i,
-                             resolved_with=None if ok else new))
-    cb = act.contested_record(rows)
-    assert cb is not None and cb["rule"]["key"] == "plan" and not cb["rule"].get("alternatives")
-
-
-def test_the_asking_tasks_covariate_keys_are_folded_like_the_records() -> None:
-    """``Plan`` on the retrieve meets ``plan`` on the rule."""
-    rows = _set_c_export_record()
-    old, new = "resolve:advise_workaround", "resolve:advise_settings_change"
-    cands = [old, new, "resolve:refund"]
-    pr = act.aggregate_priors(rows, candidate_actions=cands, situation_exact=True)
-    pr["situation_record"] = {"situation": "export timeout", "outcomes": len(rows)}
-    moved = act.recommend(pr, agent_id="a", candidate_actions=cands, covariates={" Plan ": "team", "guidance_id": "g"})
-    assert moved["mode"] == "act" and moved["suggested_action"] == new
-
-
-def test_a_conditional_plan_opens_with_the_rules_branches_not_the_stale_record() -> None:
-    """Without the covariate the plan cannot lead with the contested action
-    on the strength of its lifetime record: it opens with what wins on the
-    failing side, then the contested action where it still works."""
-    rows = _set_c_export_record()
-    old, new = "resolve:advise_workaround", "resolve:advise_settings_change"
-    cands = [old, new, "resolve:refund"]
-    pr = act.aggregate_priors(rows, candidate_actions=cands, situation_exact=True)
-    pr["situation_record"] = {"situation": "export timeout", "outcomes": len(rows)}
-    unknown = act.recommend(pr, agent_id="a", candidate_actions=cands)
-    assert unknown["mode"] == "conditional" and unknown["plan"][:2] == [new, old]
-
-    # Nothing has won on the failing side yet: its untried come before the
-    # contested action.
-    bare = [r for r in rows[:3]] + [
-        _cov_row(old, False, {"plan": "pro", "device": "web", "app_major": 9}, minutes_ago=45),
-        _cov_row(old, True, {"plan": "free", "device": "iOS", "app_major": 9}, minutes_ago=35),
-        _cov_row(old, False, {"plan": "team", "device": "web", "app_major": 9}, minutes_ago=25),
-        _cov_row(old, True, {"plan": "free", "device": "web", "app_major": 9}, minutes_ago=15),
-    ]
-    pr2 = act.aggregate_priors(bare, candidate_actions=cands, situation_exact=True)
-    pr2["situation_record"] = {"situation": "export timeout", "outcomes": len(bare)}
-    open_ = act.recommend(pr2, agent_id="a", candidate_actions=cands)
-    assert open_["mode"] == "conditional" and open_["rule"]["then"] is None
-    assert open_["plan"][0] in (new, "resolve:refund") and open_["plan"].index(old) == 2
 
 
 def test_bookkeeping_and_identifiers_are_not_covariates() -> None:

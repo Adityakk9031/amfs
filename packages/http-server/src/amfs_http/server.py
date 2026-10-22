@@ -56,6 +56,7 @@ from amfs_core.reuse_value import REUSE_VALUE_HEADER, reuse_value_block
 from amfs_core.capture import scan_captured_arguments, scan_captured_text
 from amfs_core.actions import CONTRAST_MIN_W as _CONTRAST_MIN_W
 from amfs_core.actions import actions_taken as derive_actions_taken
+from amfs_core.actions import normalize_covariates
 from amfs_core.engine import read_tracker_scope
 from amfs_core.evidence import evidence_signal as _evidence_signal
 from amfs_core.evidence import is_success as _evidence_is_success
@@ -5383,6 +5384,7 @@ async def commit_outcome(
         entity_path=req.entity_path,
         entity_paths=req.entity_paths,
         situation=req.situation[:200] if req.situation else None,
+        covariates=normalize_covariates(req.covariates) or None,
         # Not scanned here: commit_outcome scans at trace construction, so
         # every caller gets it. Scanning again would be harmless but would
         # imply this endpoint is where the guarantee lives, which is the

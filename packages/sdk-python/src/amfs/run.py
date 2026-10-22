@@ -308,17 +308,7 @@ class Run:
         separates the runs it still wins from the ones it lost; the record can
         only split on what the runs declared.
         """
-        clean: dict[str, Any] = {}
-        for key, value in covariates.items():
-            k = str(key).strip().lower()
-            if k in ENVIRONMENT_KEYS or k == SITUATION_ATTRIBUTE:
-                raise ValueError(f"{k!r} is the run's environment, not a covariate")
-            if not isinstance(value, (bool, int, float, str)):
-                raise TypeError(f"covariate {k!r} must be a scalar, got {type(value).__name__}")
-            clean[k] = value
-        if clean:
-            self.memory.set_session_attributes(clean)
-            self._covariates.update(clean)
+        self._covariates = dict(self.memory.declare_covariates(covariates))
         return dict(self._covariates)
 
     # ------------------------------------------------------------------

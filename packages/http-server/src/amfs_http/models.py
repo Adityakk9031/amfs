@@ -81,6 +81,11 @@ class OutcomeRequest(BaseModel):
     entity_path: str | None = None
     #: Optional label for the kind of task ("card-declined ticket").
     situation: str | None = None
+    #: What this task was like, as the run declared it (``{"plan": "pro"}``):
+    #: scalars keyed by name. Stored on the outcome row as its own block;
+    #: a contested situation is split on these, never on the attribute bag's
+    #: bookkeeping.
+    covariates: dict[str, Any] | None = None
 
 
 class SearchRequest(BaseModel):

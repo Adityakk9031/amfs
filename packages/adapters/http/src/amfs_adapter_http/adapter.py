@@ -438,6 +438,11 @@ class HttpAdapter(AdapterABC):
             body["actions_taken"] = list(record.actions_taken)
         if record.entity_paths:
             body["entity_paths"] = list(record.entity_paths)
+        # The task's covariates, declared: their own field, so the server
+        # splits a contested situation on what the run said the task was like
+        # and not on the bag's bookkeeping.
+        if record.covariates:
+            body["covariates"] = dict(record.covariates)
         if record.situation:
             body["situation"] = record.situation
         data = self._post("/api/v1/outcomes", body)
