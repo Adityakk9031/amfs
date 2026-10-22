@@ -2193,6 +2193,16 @@ class AgentMemory:
         """The covariates declared so far this session."""
         return dict(self._covariates)
 
+    def clear_covariates(self) -> None:
+        """Drop the covariates declared so far — from the block and from the
+        bag — without touching the rest of the bag. ``Run.begin`` calls it:
+        a run that observed and never committed must not tag the next run's
+        outcome with the previous task's plan, which would put it on the
+        wrong side of a contested split. The commit clears them itself."""
+        for key in self._covariates:
+            self._session_attributes.pop(key, None)
+        self._covariates = {}
+
     def _declare_situation(self) -> None:
         """Tell the adapter the situation the bag now carries, when it can
         listen (``HttpAdapter.declare_situation``; the local adapters have no

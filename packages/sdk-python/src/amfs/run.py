@@ -141,7 +141,11 @@ class Run:
         self.task_input = task if isinstance(task, str) else json.dumps(task, default=str)
         self._candidate_actions = list(candidate_actions) if candidate_actions else None
         self._situation = situation
+        # This run's covariates start empty on the session too: an earlier
+        # run that observed and never reached ``complete`` left its block
+        # behind, and ``observe`` below would merge into it.
         self._covariates = {}
+        self.memory.clear_covariates()
         if covariates:
             self.observe(**dict(covariates))
 

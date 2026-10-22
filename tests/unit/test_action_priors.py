@@ -853,6 +853,21 @@ def test_declared_covariates_travel_as_their_own_block_apart_from_the_bags_bookk
     assert mem.covariates == {}
     assert mem.session_attributes == {}
 
+    # A run that observed and never completed leaves nothing for the next
+    # one (Bugbot on #494): begin clears the block and its keys from the bag,
+    # and only those keys.
+    abandoned = Run(mem)
+    abandoned.begin("export times out", entity_path="acme/support", covariates={"plan": "enterprise"})
+    mem.set_session_attributes({"task_type": "ticket"})
+    fresh = Run(mem)
+    fresh.begin("card declined", entity_path="acme/support", situation="card declined")
+    assert mem.covariates == {} and "plan" not in mem.session_attributes
+    assert mem.session_attributes["task_type"] == "ticket"
+    fresh.observe(issuer="JP")
+    captured.clear()
+    fresh.complete(False)
+    assert captured["r"].covariates == {"issuer": "JP"}
+
 
 def test_commit_outcome_scans_the_action_key_for_secrets(mem: AgentMemory, monkeypatch) -> None:
     """When the gate blocks the derived key, the action keeps only its tool name."""
