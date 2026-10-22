@@ -34,7 +34,7 @@ from amfs_core.exclusions import (
     AGENT_ID_NOT_EXCLUDED_SQL,
     ENTITY_PATH_NOT_EXCLUDED_SQL,
 )
-from amfs_core.actions import entity_paths_of, recorded_environment
+from amfs_core.actions import entity_paths_of, recorded_covariates, recorded_environment
 from amfs_core.evidence import cited_entries, outcome_model, outcome_read_keys, outcome_verified_by
 from amfs_core.models import (
     OUTCOME_MULTIPLIERS,
@@ -312,6 +312,10 @@ _LOCAL_EVIDENCE_SQL = (
 #: retrieve weights query terms against. Same treatment as 008–010.
 _OUTCOME_TASK_TEXT_SQL = (
     Path(__file__).parent / "migrations" / "011_outcome_task_text.sql"
+).read_text(encoding="utf-8")
+#: Migration 014 — the covariates of the task on the outcome row.
+_OUTCOME_COVARIATES_SQL = (
+    Path(__file__).parent / "migrations" / "014_outcome_covariates.sql"
 ).read_text(encoding="utf-8")
 #: Migration 012 — the evidence functions rendered from ``amfs_core.evidence``
 #: (``evidence_sql.render_evidence_sql``), replacing the hand-written bodies
@@ -864,6 +868,7 @@ class PostgresAdapter(AdapterABC):
         self._has_outcome_embedding_col = False
         self._has_outcome_env_col = False
         self._has_task_text_col = False
+        self._has_covariates_col = False
         self._has_verified_by_col = False
         self._pgvector_version: tuple[int, ...] | None = None
         # When an embedder is provided, embeddings are computed at write time and
@@ -1375,6 +1380,12 @@ class PostgresAdapter(AdapterABC):
             ALTER TABLE amfs_outcomes
             ADD COLUMN IF NOT EXISTS environment JSONB
         """)
+        # The covariates of the task — the run's declared attributes other
+        # than its environment and situation (the customer's plan, the app
+        # version a lookup showed) — so a contested situation's record can be
+        # split by what separates the runs the old action still wins from the
+        # ones it lost (amfs_core.actions.split_contested). See migration 014.
+        cur.execute(_OUTCOME_COVARIATES_SQL)
         # Query-conditioned evidence: see migration 010.
         cur.execute(_LOCAL_EVIDENCE_SQL)
         # The task text on outcomes: see migration 011.
@@ -1845,7 +1856,7 @@ class PostgresAdapter(AdapterABC):
                     WHERE table_name = 'amfs_outcomes'
                       AND column_name IN (
                         'actions_taken', 'task_embedding', 'environment', 'task_text',
-                        'verified_by'
+                        'verified_by', 'covariates'
                       )
                     """,
                 )
@@ -1855,6 +1866,7 @@ class PostgresAdapter(AdapterABC):
                 self._has_outcome_env_col = "environment" in found
                 self._has_task_text_col = "task_text" in found
                 self._has_verified_by_col = "verified_by" in found
+                self._has_covariates_col = "covariates" in found
 
     # ------------------------------------------------------------------
     # read
@@ -4248,6 +4260,15 @@ class PostgresAdapter(AdapterABC):
                         columns.append("environment")
                         placeholders.append("%s::jsonb")
                         params.append(json.dumps(env))
+                if getattr(self, "_has_covariates_col", False):
+                    covariates = recorded_covariates({
+                        "covariates": record.covariates or None,
+                        "session_metadata": record.session_metadata or {},
+                    })
+                    if covariates:
+                        columns.append("covariates")
+                        placeholders.append("%s::jsonb")
+                        params.append(json.dumps(covariates, default=str))
                 task_embedding = self._outcome_embedding(record)
                 if task_embedding is not None:
                     columns.append("task_embedding")
@@ -4556,9 +4577,10 @@ class PostgresAdapter(AdapterABC):
             conditions.append("committed_at >= %s")
             params.append(since)
         env_col = ", environment" if getattr(self, "_has_outcome_env_col", False) else ""
+        cov_col = ", covariates" if getattr(self, "_has_covariates_col", False) else ""
         sql = f"""
             SELECT outcome_ref, outcome_type, committed_at, agent_id, actions_taken, situation,
-                   1 - (task_embedding <=> %s::vector) AS similarity{env_col}
+                   1 - (task_embedding <=> %s::vector) AS similarity{env_col}{cov_col}
             FROM amfs_outcomes
             WHERE {" AND ".join(conditions)}
             ORDER BY task_embedding <=> %s::vector
@@ -4581,6 +4603,7 @@ class PostgresAdapter(AdapterABC):
                 "situation": row.get("situation"),
                 "actions_taken": _jsonb(row.get("actions_taken"), []),
                 "environment": _jsonb(row.get("environment"), {}) or {},
+                "covariates": _jsonb(row.get("covariates"), {}) or {},
                 "similarity": sim,
             })
         return out
@@ -4788,8 +4811,9 @@ class PostgresAdapter(AdapterABC):
             conditions.append("committed_at >= %s")
             params.append(since)
         env_col = ", environment" if getattr(self, "_has_outcome_env_col", False) else ""
+        cov_col = ", covariates" if getattr(self, "_has_covariates_col", False) else ""
         sql = f"""
-            SELECT outcome_ref, outcome_type, committed_at, agent_id, actions_taken, situation{env_col}
+            SELECT outcome_ref, outcome_type, committed_at, agent_id, actions_taken, situation{env_col}{cov_col}
             FROM amfs_outcomes
             WHERE {" AND ".join(conditions)}
             ORDER BY committed_at DESC
@@ -4807,6 +4831,7 @@ class PostgresAdapter(AdapterABC):
             "situation": row.get("situation"),
             "actions_taken": _jsonb(row.get("actions_taken"), []),
             "environment": _jsonb(row.get("environment"), {}) or {},
+            "covariates": _jsonb(row.get("covariates"), {}) or {},
             "similarity": 1.0,
         } for row in rows]
 

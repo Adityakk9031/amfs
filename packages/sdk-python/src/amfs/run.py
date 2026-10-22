@@ -93,6 +93,7 @@ class Run:
         self.guidances: list[Guidance] = []
         self._candidate_actions: list[str] | None = None
         self._situation: str | None = None
+        self._covariates: dict[str, Any] = {}
         self._completed = False
 
     # ------------------------------------------------------------------
@@ -111,6 +112,7 @@ class Run:
         unit: str | None = None,
         candidate_actions: list[str] | None = None,
         situation: str | None = None,
+        covariates: Mapping[str, Any] | None = None,
         limit: int = BEGIN_LIMIT,
     ) -> Guidance:
         """Open the run and return the guidance to inject.
@@ -127,12 +129,25 @@ class Run:
         scopes the retrieve, is stamped on the trace, and is declared to the
         server on every request from here on — a canary on a fix for that
         situation routes only the sessions that declare it, which is why it
-        is given at ``begin`` and not at commit.
+        is given at ``begin`` and not at commit. *covariates* are what this
+        task is like, as scalars (``{"plan": "pro", "region": "eu"}``): they
+        are stamped on the outcome, so when a rule stops working for part of
+        a situation the record can say which part (the plan, the version),
+        and they are sent with the retrieve so a rule already split that way
+        is read for this task. What a lookup shows later goes through
+        :meth:`observe`.
         """
         self.entity_path = entity_path
         self.task_input = task if isinstance(task, str) else json.dumps(task, default=str)
         self._candidate_actions = list(candidate_actions) if candidate_actions else None
         self._situation = situation
+        # This run's covariates start empty on the session too: an earlier
+        # run that observed and never reached ``complete`` left its block
+        # behind, and ``observe`` below would merge into it.
+        self._covariates = {}
+        self.memory.clear_covariates()
+        if covariates:
+            self.observe(**dict(covariates))
 
         # The explicit keywords win over the mapping, but only when given:
         # an unset keyword must not erase what ``environment`` carried.
@@ -172,6 +187,7 @@ class Run:
                 include_priors=True,
                 candidate_actions=self._candidate_actions,
                 situation=situation,
+                covariates=self._covariates or None,
                 compact=True,
                 limit=limit,
                 abstain=True,
@@ -260,6 +276,7 @@ class Run:
                 include_priors=True,
                 candidate_actions=candidates,
                 situation=self._situation,
+                covariates=self._covariates or None,
                 compact=True,
                 limit=HINT_LIMIT,
                 abstain=True,
@@ -277,6 +294,26 @@ class Run:
             return None
         self._stamp(guidance)
         return guidance
+
+    # ------------------------------------------------------------------
+    # observe
+    # ------------------------------------------------------------------
+
+    def observe(self, **covariates: Any) -> dict[str, Any]:
+        """Declare what this task turned out to be like — the facts a lookup
+        showed (``run.observe(app_major=9, issuer="US")``) — as covariates on
+        the outcome and on every retrieve from here on. Scalars only (``str``,
+        ``int``, ``float``, ``bool``); the session attribute bag's limits
+        apply (20 keys). Keys that name the run's environment (``model``,
+        ``runtime``, ``platform``, ``agent_version``) or ``situation`` are
+        not covariates and raise. Returns the covariates as they now stand.
+
+        A rule that stopped working for part of a situation is found by what
+        separates the runs it still wins from the ones it lost; the record can
+        only split on what the runs declared.
+        """
+        self._covariates = dict(self.memory.declare_covariates(covariates))
+        return dict(self._covariates)
 
     # ------------------------------------------------------------------
     # attempt_failed

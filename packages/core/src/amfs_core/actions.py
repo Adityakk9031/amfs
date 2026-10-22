@@ -24,6 +24,7 @@ from __future__ import annotations
 import hashlib
 import math
 import re
+from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Iterable, Mapping, Sequence
@@ -105,6 +106,28 @@ REGIME_TURN_STREAK = 2
 #: Reading the sibling as a contradiction abstained on both classes when the
 #: neighbourhood-weighted record named the right fix for each.
 POOLED_WEIGHT_RATIO = 0.6
+#: A *contested* rule: a validated action on the situation's own record that
+#: has lost since some point and still wins since the same point — the shape
+#: of a change that moved part of a situation and left the rest (the export
+#: fix stops working on paid plans and keeps working on the free one). No
+#: streak forms, ``p`` drifts, and ``act`` keeps naming the stale action:
+#: measured on the 2026-10-21 regime study (set C, conditional changes), with
+#: the record read by situation identity the recommendation was ``act`` on
+#: 59 % of the first searches after a change and the action it named was the
+#: stale one on 54 %. Read over the action's newest ``CONTESTED_WINDOW`` takes.
+CONTESTED_WINDOW = 16
+#: Losses on the failing side and wins on the working side a covariate split
+#: needs before it is a rule, and the exceptions it tolerates in total. Two
+#: and two is the least that tells a condition from a fluke; the same study
+#: found the true condition on 11 of the 16 splits this made, and none of
+#: the 12 it made on the kept half applied wrongly.
+CONTESTED_MIN_SIDE = 2
+CONTESTED_MAX_EXCEPTIONS = 1
+#: Share of the contested takes a covariate must be declared on to be split on.
+COVARIATE_COVERAGE = 0.8
+#: Evidence cases served with a contested rule: the newest takes of the
+#: action since the contest began, with their covariates and how they ended.
+CONTESTED_CASES = 6
 #: Longest plan :func:`plan_actions` returns.
 PLAN_MAX = 5
 #: Most actions the footer's "Tried" and "Do not spend an attempt on" lines
@@ -376,7 +399,7 @@ def aggregate_priors(
     tried = sorted(priors.values(), key=lambda p: (-p.p, -p.n, p.action_key))
     tried_keys = {p.action_key for p in tried}
     untried = [a for a in (candidate_actions or []) if a and a not in tried_keys]
-    return {
+    out: dict[str, Any] = {
         "tried": [p.as_dict() for p in tried],
         "untried": untried,
         "n_outcomes": len(rows),
@@ -388,6 +411,356 @@ def aggregate_priors(
         ),
         "contrasts": contrasts,
     }
+    if situation_exact:
+        # Only on the situation's own record: on a neighbourhood, wins and
+        # losses of one action are as likely two classes as one changed rule.
+        contested = contested_record(rows)
+        if contested is not None:
+            out["contested"] = contested
+    return out
+
+
+# ── Contested rules ─────────────────────────────────────────────────────
+
+
+def _takes(rows: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """Every decisive action on *rows* as one take — ``{at, action_key,
+    success, covariates, outcome_ref, resolved_with}`` — oldest first.
+    ``resolved_with`` is the action that went on to solve the task after this
+    one lost, when one did."""
+    takes: list[dict[str, Any]] = []
+    for row in rows:
+        at = _as_dt(row.get("committed_at"))
+        covariates = recorded_covariates(row)
+        acts = [a for a in (row.get("actions_taken") or []) if a.get("action_key")]
+        solved = is_success(str(row.get("outcome_type") or "success"))
+        resolved = next(
+            (str(a["action_key"]) for a in acts if a.get("attempt") is None and a.get("success")),
+            None,
+        ) if solved else None
+        for act in acts:
+            ok = bool(act.get("success"))
+            takes.append({
+                "at": at,
+                "action_key": str(act["action_key"]),
+                "success": ok,
+                "covariates": covariates,
+                "outcome_ref": row.get("outcome_ref"),
+                "resolved_with": resolved if (not ok and resolved and resolved != act["action_key"]) else None,
+            })
+    takes.sort(key=lambda t: t["at"] or datetime.min.replace(tzinfo=timezone.utc))
+    return takes
+
+
+def contested_record(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    window: int = CONTESTED_WINDOW,
+    min_wins: int = REGIME_MIN_WINS,
+) -> dict[str, Any] | None:
+    """The contested rule on a situation's own record, or ``None``.
+
+    An action is contested when, over its newest *window* takes, it has
+    lost after winning — at least *min_wins* wins in all, and a loss some
+    win preceded — and the record since that loss is not a clean turn: it
+    has won since, **or** a covariate separates the losses since from the
+    wins (:func:`split_contested`), which is the record of a rule that
+    stopped working for *part* of the situation. (Losses with no win since
+    and no such covariate are a turn, read by :func:`turned` /
+    :func:`_stopped_working`; one loss with no take since is the first
+    strike, reported as ``lost_since == 1`` so the reader can show it, and
+    nothing more.) The most-won such action is the one reported.
+
+    The contest is dated from the earliest loss in the window that yields a
+    rule, else from the earliest loss some win preceded. Dating from the
+    first loss is what lets a thin record speak: the study's Beam cells
+    (2026-10) held the old fix at W L W L L on the changed situations —
+    three losses the streak logic read as a turn and sent *every* task
+    exploring, when the plan on each case already said which half had
+    moved.
+
+    The block: ``action``, ``since`` (the loss the contest is dated from),
+    ``won_before``, ``won_since``, ``lost_since``; ``rule`` — the covariate
+    that separates the losses from the wins, when one does; ``cases`` — the
+    newest :data:`CONTESTED_CASES` takes since then, covariates and all, old
+    and new side by side; and ``side_record`` — what every *other* action
+    did since then on the failing side of the rule (or on every take,
+    without one), so the recommendation can name what has worked where the
+    rule has not.
+    """
+    takes = _takes(rows)
+    by_action: dict[str, list[dict[str, Any]]] = {}
+    for t in takes:
+        by_action.setdefault(t["action_key"], []).append(t)
+    ranked = sorted(
+        by_action.items(),
+        key=lambda kv: (-sum(1 for t in kv[1] if t["success"]), kv[0]),
+    )
+    for action, mine in ranked:
+        recent = mine[-window:]
+        wins_total = sum(1 for t in mine if t["success"])
+        if wins_total < min_wins or all(t["success"] for t in recent):
+            continue
+        # Every loss in the window that some win preceded is a candidate
+        # start; a loss before the action ever won is noise, not a change.
+        starts: list[int] = []
+        seen_win = False
+        for i, t in enumerate(mine):
+            if t["success"]:
+                seen_win = True
+            elif seen_win and t in recent:
+                starts.append(i)
+        if not starts:
+            continue
+        since_idx = starts[0]
+        rule: dict[str, Any] | None = None
+        for start in starts:
+            rule = split_contested(mine[start:], prior=mine[:start])
+            if rule is not None:
+                since_idx = start
+                break
+        since = mine[since_idx:]
+        wins_before = sum(1 for t in mine[:since_idx] if t["success"])
+        won_since = sum(1 for t in since if t["success"])
+        lost_since = sum(1 for t in since if not t["success"])
+        if rule is None and won_since == 0 and lost_since > 1:
+            # Stopped working outright: the streak logic's case, not a contest.
+            continue
+        if won_since == 0 and lost_since == 1 and since[-1] is not mine[-1]:
+            continue
+        at = mine[since_idx]["at"]
+        failing_side = (
+            [t for t in takes if t["at"] is not None and at is not None and t["at"] >= at
+             and _rule_applies(rule, t["covariates"])]
+            if rule else
+            [t for t in takes if t["at"] is not None and at is not None and t["at"] >= at]
+        )
+        side: dict[str, dict[str, int]] = {}
+        for t in failing_side:
+            if t["action_key"] == action:
+                continue
+            rec = side.setdefault(t["action_key"], {"won": 0, "lost": 0})
+            rec["won" if t["success"] else "lost"] += 1
+        cases = [
+            {
+                "when": t["at"].isoformat() if t["at"] else None,
+                "covariates": dict(t["covariates"]),
+                "outcome": "won" if t["success"] else "lost",
+                **({"resolved_with": t["resolved_with"]} if t["resolved_with"] else {}),
+            }
+            # The newest takes of the action, old wins beside new losses:
+            # a contest two takes old shows the record it broke from.
+            for t in list(reversed(mine))[:CONTESTED_CASES]
+        ]
+        return {
+            "action": action,
+            "since": at.isoformat() if at else None,
+            "won_before": wins_before,
+            "won_since": won_since,
+            "lost_since": lost_since,
+            "rule": rule,
+            "cases": cases,
+            "side_record": [
+                {"action_key": k, **v} for k, v in sorted(side.items(), key=lambda kv: -kv[1]["won"])
+            ],
+        }
+    return None
+
+
+def split_contested(
+    takes: Sequence[Mapping[str, Any]],
+    *,
+    prior: Sequence[Mapping[str, Any]] = (),
+    min_side: int = CONTESTED_MIN_SIDE,
+    max_exceptions: int = CONTESTED_MAX_EXCEPTIONS,
+    coverage: float = COVARIATE_COVERAGE,
+) -> dict[str, Any] | None:
+    """The one covariate that separates the losses in *takes* (one action's
+    takes since its contest began, each with ``covariates`` and ``success``)
+    from the wins, or ``None``.
+
+    A categorical key splits on the values where losses outnumber wins; a
+    numeric key tries every threshold first (``>= 9`` carries to 10 where
+    ``in {9}`` does not). A split is a rule when the failing side holds at
+    least *min_side* losses since the contest began, the working side at
+    least *min_side* wins **of which at least one is since the contest
+    began**, and at most *max_exceptions* takes sit on the wrong side — a
+    win since on the failing side, a loss on the working side. The fewest
+    exceptions win, then the most takes since explained, then the most
+    overall.
+
+    The win since on the working side is what tells a split from a turn.
+    An action that won six times and then lost four (W W W W W W L L L L)
+    has *some* covariate on which the four losses agree — with four keys
+    of two or three values each, almost surely — and on the study's
+    card-declined cells (2026-10) the split read the issuer's change as the
+    device's: every loss on Android, by chance, and the kept half's Android
+    tickets sent exploring. A win since the first loss where the covariate
+    differs is the one observation no turn produces.
+
+    *prior* — the action's takes before the contest — count on the working
+    side only: a win there where the rule says the action still works is
+    evidence it does (the record before the change is the only record of
+    the kept half a thin history may have), while a win there on the
+    failing side is what *changed* and is not held against the rule. Only
+    keys declared on at least *coverage* of the takes are tried: a
+    covariate a few runs happened to declare explains nothing about the
+    rest. Returns ``{"key", "fails_when": [...] | {">=": x} | {"<": x},
+    "works_when": [...] | ..., "failing": {"won", "lost"}, "working":
+    {"won", "lost"}}``.
+    """
+    rows = [(t["covariates"], bool(t["success"])) for t in takes if isinstance(t.get("covariates"), Mapping)]
+    before = [(t["covariates"], bool(t["success"])) for t in prior if isinstance(t.get("covariates"), Mapping)]
+    if sum(1 for _, ok in rows if not ok) < min_side or not any(ok for _, ok in rows):
+        return None
+    if sum(1 for _, ok in rows if ok) + sum(1 for _, ok in before if ok) < min_side:
+        return None
+    keys = {k for cv, _ in rows for k in cv}
+    best: tuple[tuple[int, int], dict[str, Any]] | None = None
+    for key in sorted(keys):
+        have = [(cv[key], ok) for cv, ok in rows if key in cv]
+        if len(have) < coverage * len(rows):
+            continue
+        earlier = [(cv[key], ok) for cv, ok in before if key in cv]
+        values = sorted({v for v, _ in have} | {v for v, _ in earlier}, key=lambda v: (str(type(v)), v))
+        if len(values) < 2:
+            continue
+        numeric = all(isinstance(v, int | float) and not isinstance(v, bool) for v in values)
+        candidates: list[tuple[str, Any]] = []
+        if numeric:
+            for threshold in values[1:]:
+                candidates.append((">=", threshold))
+                candidates.append(("<", threshold))
+        # A categorical key whose values hardly ever repeat is an identifier
+        # (a ticket number, an email, a client's own id), not a covariate:
+        # the values the losses carry would "explain" every loss with no
+        # exception. The test is on the values, not the observations: an
+        # identifier's values are nearly all singletons however long the
+        # record (a returning customer is one repeat in twenty), while a
+        # covariate's repeat — a plan on three values over the minimum
+        # contest of two losses and two wins has one value twice, and that
+        # repeat is what tells it from an id. Over three-quarters of the
+        # values seen once refuses the split. (A numeric id that runs with
+        # time makes a clean turn, which the win-since requirement below
+        # already refuses.)
+        fails = [
+            v for v in values
+            if sum(1 for x, ok in have if x == v and not ok) > sum(1 for x, ok in have if x == v and ok)
+        ]
+        seen = Counter([v for v, _ in have] + [v for v, _ in earlier])
+        singletons = sum(1 for v in values if seen[v] == 1)
+        identifier = singletons * 4 > len(values) * 3
+        if fails and len(fails) < len(values) and not identifier:
+            candidates.append(("in", fails))
+        for op, arg in candidates:
+            def on_side(v: Any, op: str = op, arg: Any = arg) -> bool:
+                if op == "in":
+                    return v in arg
+                if op == ">=":
+                    return v >= arg
+                return v < arg
+            l_in = sum(1 for v, ok in have if on_side(v) and not ok)
+            w_in = sum(1 for v, ok in have if on_side(v) and ok)
+            l_out = sum(1 for v, ok in have if not on_side(v) and not ok)
+            w_out_since = sum(1 for v, ok in have if not on_side(v) and ok)
+            # The record before the contest, on the working side only.
+            w_out = w_out_since + sum(1 for v, ok in earlier if not on_side(v) and ok)
+            l_out += sum(1 for v, ok in earlier if not on_side(v) and not ok)
+            exceptions = w_in + l_out
+            if l_in < min_side or w_out < min_side or w_out_since < 1 or exceptions > max_exceptions:
+                continue
+            # Scored on the record since the contest only: the wins before
+            # it meet the floor but do not rank — they fell where they fell
+            # before anything changed, and a key they happen to favour is
+            # not thereby the key that matters.
+            score = (-exceptions, l_in + w_out_since)
+            if best is not None and score < best[0]:
+                continue
+            if op == "in":
+                fails_when: Any = list(arg)
+                works_when: Any = [v for v in values if v not in arg]
+            elif op == ">=":
+                fails_when, works_when = {">=": arg}, {"<": arg}
+            else:
+                fails_when, works_when = {"<": arg}, {">=": arg}
+            found = {
+                "key": key,
+                "fails_when": fails_when,
+                "works_when": works_when,
+                "failing": {"won": w_in, "lost": l_in},
+                "working": {"won": w_out, "lost": l_out},
+            }
+            if best is None or score > best[0]:
+                best = (score, found)
+            elif found["key"] != best[1]["key"]:
+                # Another key fits the same takes as well: with two losses
+                # and one win since, several usually do (on the study's
+                # export-timeout cell the plan's change read as the
+                # issuer's, both losses JP by chance). Carried as an
+                # alternative; the rule is read for a task only where every
+                # alternative puts it on the same side.
+                best[1].setdefault("alternatives", []).append(
+                    {k: found[k] for k in ("key", "fails_when", "works_when")}
+                )
+    return best[1] if best else None
+
+
+def _one_rule_applies(rule: Mapping[str, Any], covariates: Mapping[str, Any]) -> bool | None:
+    key = rule.get("key")
+    if key not in covariates:
+        return None
+    value = covariates[key]
+    fails = rule.get("fails_when")
+    try:
+        if isinstance(fails, list):
+            return value in fails
+        if isinstance(fails, Mapping) and ">=" in fails:
+            return value >= fails[">="]
+        if isinstance(fails, Mapping) and "<" in fails:
+            return value < fails["<"]
+    except TypeError:
+        return None
+    return None
+
+
+def _rule_applies(rule: Mapping[str, Any] | None, covariates: Mapping[str, Any] | None) -> bool | None:
+    """Whether *covariates* put a task on the failing side of *rule*: ``True``
+    / ``False``, or ``None`` when the rule's key is not declared on them,
+    there is no rule, or the rule's ``alternatives`` (other keys that split
+    the record as well) put the task on the other side — the record cannot
+    yet say which covariate matters, and this task is where they differ."""
+    if not rule or not isinstance(covariates, Mapping):
+        return None
+    sides = {_one_rule_applies(rule, covariates)}
+    for alt in rule.get("alternatives") or []:
+        if isinstance(alt, Mapping):
+            sides.add(_one_rule_applies(alt, covariates))
+    return sides.pop() if len(sides) == 1 else None
+
+
+def describe_rule(rule: Mapping[str, Any]) -> tuple[str, str]:
+    """``(fails_when, works_when)`` as short phrases: ``plan in {pro, team}``
+    / ``plan = free``; ``app_major >= 9`` / ``app_major < 9``. With
+    ``alternatives``, each side names them too: ``plan = pro (or issuer =
+    JP — the record cannot yet tell which)``."""
+
+    def _side(key: str, cond: Any) -> str:
+        if isinstance(cond, list):
+            if len(cond) == 1:
+                return f"{key} = {cond[0]}"
+            return f"{key} in {{{', '.join(str(v) for v in cond)}}}"
+        if isinstance(cond, Mapping):
+            op, val = next(iter(cond.items()))
+            return f"{key} {op} {val}"
+        return key
+
+    key = str(rule.get("key"))
+    fails, works = _side(key, rule.get("fails_when")), _side(key, rule.get("works_when"))
+    alts = [a for a in (rule.get("alternatives") or []) if isinstance(a, Mapping)]
+    if alts:
+        fails += " (or " + " / ".join(_side(str(a.get("key")), a.get("fails_when")) for a in alts) + " — the record cannot yet tell which)"
+        works += " (or " + " / ".join(_side(str(a.get("key")), a.get("works_when")) for a in alts) + ")"
+    return fails, works
 
 
 def recorded_environment(row: Mapping[str, Any]) -> dict[str, str]:
@@ -413,6 +786,59 @@ def recorded_environment(row: Mapping[str, Any]) -> dict[str, str]:
             value = source.get(key)
             if isinstance(value, str) and value.strip():
                 out[key] = value.strip()
+    return out
+
+
+#: Session attributes that are not covariates: the run's environment (its
+#: own dimensions, weighted by :func:`_env_match`), the situation label the
+#: record is partitioned by, and the bookkeeping the SDK and server stamp on
+#: the bag — the served guidance's id and count, the branch, the canary
+#: assignment, the replay delivery, the verifier, the final action's index,
+#: the scope. None describes the task; a unique id would split any record
+#: perfectly and a counter would split it by time.
+_NOT_COVARIATES: frozenset[str] = frozenset({
+    *ENVIRONMENT_KEYS, "situation",
+    "guidance_id", "guidance_count", "memory_branch", "canary_fix_id", "canary_arm",
+    "replay_delivery_id", "verified_by", "final_action_index",
+    "entity_path", "agent_id", "session", "session_id", "trace_id", "outcome_ref",
+})
+
+
+def normalize_covariates(covariates: Mapping[str, Any] | None) -> dict[str, Any]:
+    """*covariates* as the record keeps them: keys stripped and lowercased,
+    scalar values only, the non-covariate keys (:data:`_NOT_COVARIATES`)
+    dropped. The one folding both the recorded rows and the asking task's
+    declaration go through, so ``Plan`` on a retrieve meets ``plan`` on a rule."""
+    out: dict[str, Any] = {}
+    if not isinstance(covariates, Mapping):
+        return out
+    for key, value in covariates.items():
+        k = str(key).strip().lower()
+        if not k or k in _NOT_COVARIATES or k in out:
+            continue
+        if isinstance(value, bool | int | float | str):
+            out[k] = value
+    return out
+
+
+def recorded_covariates(row: Mapping[str, Any]) -> dict[str, Any]:
+    """The covariates an outcome row carries — the scalar attributes the run
+    declared about the *task* (``Run.observe`` / ``Run.begin(covariates=
+    ...)``: the customer's plan, the app version the lookup showed, the card's
+    issuer country), as distinct from the run's own environment. Read from the
+    ``covariates`` block when the row has one — the declared channel, taken
+    whole — else from the session metadata's ``attributes`` bag (older SDKs
+    declare through ``set_session_attributes``) less the environment keys,
+    the situation and the SDK's bookkeeping. Values are scalars; anything
+    else is dropped."""
+    declared = normalize_covariates(row.get("covariates"))
+    if declared:
+        return declared
+    meta = row.get("session_metadata")
+    out: dict[str, Any] = {}
+    for source in ((meta.get("attributes") if isinstance(meta, Mapping) else None), row.get("attributes")):
+        for k, v in normalize_covariates(source).items():
+            out.setdefault(k, v)
     return out
 
 
@@ -548,6 +974,7 @@ def recommend(
     lessons: Sequence[Mapping[str, Any]] | None = None,
     min_p: float = ACT_MIN_P,
     min_n: int = ACT_MIN_N,
+    covariates: Mapping[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     """Decide ``act`` / ``explore`` / ``escalate`` from priors and the top hit.
 
@@ -647,6 +1074,9 @@ def recommend(
     record_tried: list[Mapping[str, Any]] = list((priors or {}).get("tried") or [])
     untried: list[str] = list((priors or {}).get("untried") or [])
     have_candidates = bool(candidate_actions)
+    # The asking task's covariates, folded as the record's are (keys lowercased,
+    # bookkeeping dropped), so ``Plan`` on the retrieve meets ``plan`` on a rule.
+    covariates = normalize_covariates(covariates) or None
     # The mode is decided over the actions the caller can take. A winner
     # outside ``candidate_actions`` — a retry asking over what it has not
     # tried, after the winner just failed on this very task — cannot be acted
@@ -702,6 +1132,26 @@ def recommend(
     # are what a shift looks like at the action level ("what worked here has
     # stopped working"), and they are named in the explore that follows.
     winners = [t for t in tried if _is_winner(t, min_p=min_p, min_n=min_n)]
+
+    # A contested rule on the situation's own record (:func:`contested_record`):
+    # the action has lost since some point and won since the same point, so
+    # no streak forms and its lifetime record still reads as a winner. Read
+    # before the winners are acted on. With the asking task's *covariates*
+    # and a rule the record split on, the task is on one side of it and the
+    # recommendation is for that side; without, the contested action is not
+    # acted on — the record cannot say which half this task is in — and the
+    # evidence is served for the agent to weigh.
+    contested = (priors or {}).get("contested")
+    if isinstance(contested, Mapping) and contested.get("action"):
+        decided = _recommend_contested(
+            contested, tried=tried, untried=untried, winners=winners,
+            candidate_actions=candidate_actions, allowed=allowed, agent_id=agent_id,
+            covariates=covariates, priors=priors,
+        )
+        if decided is not None:
+            return _with_plan(decided)
+        if int(contested.get("lost_since") or 0) >= CONTESTED_MIN_SIDE:
+            winners = [w for w in winners if str(w.get("action_key")) != str(contested["action"])]
     # Named in the explore when the record behind them is real: ``min_n``
     # wins pooled, or any win on the situation's own record.
     stopped = [
@@ -738,6 +1188,163 @@ def recommend(
         regime_shift=regime_shift, regime_shift_at=regime_shift_at, abstain=abstain,
         hit_statuses=hit_statuses, priors_are_local=priors_are_local,
     ))
+
+
+def _contested_evidence(contested: Mapping[str, Any]) -> dict[str, Any]:
+    """The part of a contested block a recommendation carries: enough for a
+    reader to see the contest and its cases, without the side record."""
+    return {
+        k: contested.get(k)
+        for k in ("action", "since", "won_before", "won_since", "lost_since", "rule")
+    } | {"cases": list(contested.get("cases") or [])[:CONTESTED_CASES]}
+
+
+def _when(iso: Any) -> str:
+    """A date for the footer: ``2026-10-03`` from an ISO timestamp."""
+    return str(iso)[:10] if iso else "a recent change"
+
+
+def _recommend_contested(
+    contested: Mapping[str, Any],
+    *,
+    tried: list[Mapping[str, Any]],
+    untried: list[str],
+    winners: list[Mapping[str, Any]],
+    candidate_actions: Sequence[str] | None,
+    allowed: set[str] | None,
+    agent_id: str,
+    covariates: Mapping[str, Any] | None,
+    priors: Mapping[str, Any] | None,
+) -> dict[str, Any] | None:
+    """The recommendation on a contested rule, or ``None`` to let the normal
+    reading stand (the first strike: one loss, nothing since).
+
+    With a *rule* the record split on and the asking task's *covariates*
+    naming its side: ``act`` on the contested action where it still works;
+    on the failing side, ``act`` on what has won there, else ``explore`` the
+    untried there — never the contested action. With a rule but no
+    covariate for this task: ``conditional`` — the rule is stated and the
+    agent checks the covariate before acting. With no rule: ``explore``, the
+    contested action set aside, the cases served for the agent to weigh.
+    """
+    action = str(contested["action"])
+    lost = int(contested.get("lost_since") or 0)
+    won = int(contested.get("won_since") or 0)
+    before = int(contested.get("won_before") or 0)
+    when = _when(contested.get("since"))
+    rule = contested.get("rule") if isinstance(contested.get("rule"), Mapping) else None
+    evidence = _contested_evidence(contested)
+    side_record = [r for r in (contested.get("side_record") or []) if r.get("action_key")]
+
+    def _open(there: Sequence[Mapping[str, Any]]) -> list[str]:
+        tried_there = {str(r["action_key"]) for r in there}
+        pool = [str(a) for a in (candidate_actions or []) if a] or list(untried)
+        return [
+            a for a in pool
+            if a != action and a not in tried_there and (allowed is None or a in allowed)
+        ]
+
+    if rule is not None:
+        fails_when, works_when = describe_rule(rule)
+        failing, working = rule.get("failing") or {}, rule.get("working") or {}
+        f_l, f_w = int(failing.get("lost", 0)), int(failing.get("won", 0))
+        w_w, w_l = int(working.get("won", 0)), int(working.get("lost", 0))
+        split_text = (
+            f"{action} still works where {works_when} ({w_w}/{w_w + w_l}) but has failed where "
+            f"{fails_when} ({f_l} lost / {f_w} won since {when})"
+        )
+        side = _rule_applies(rule, covariates)
+        if side is False:
+            if allowed is not None and action not in allowed:
+                return None
+            return {
+                "mode": "act",
+                "suggested_action": action,
+                "contested": evidence,
+                "why": f"{split_text} — this task is where it works",
+            }
+        there = [r for r in side_record if int(r.get("won", 0)) >= 1
+                 and (allowed is None or str(r["action_key"]) in allowed)]
+        opened = _open(side_record)
+        if side is True:
+            if there:
+                best = there[0]
+                n = int(best["won"]) + int(best["lost"])
+                clean = int(best["lost"]) == 0
+                return {
+                    "mode": "act" if (int(best["won"]) >= ACT_MIN_N or clean) else "explore",
+                    "suggested_action": str(best["action_key"]),
+                    "contested": evidence,
+                    "why": (
+                        f"{split_text}; this task is on the failing side, where "
+                        f"{best['action_key']} won {best['won']}/{n}"
+                    ),
+                }
+            pick = opened[stable_bucket(agent_id, len(opened))] if opened else None
+            return {
+                "mode": "explore",
+                "suggested_action": pick,
+                "untried": opened,
+                "contested": evidence,
+                "why": (
+                    f"{split_text}; this task is on the failing side, where nothing has worked "
+                    f"yet — do not take {action}; "
+                    + (f"untried there: {', '.join(opened[:6])}" if opened else "every candidate has been tried there")
+                ),
+            }
+        # The rule is known; which side this task is on is not (the covariate
+        # was not declared on the retrieve). The agent checks it.
+        there_text = (
+            f"there {there[0]['action_key']} won {there[0]['won']}/{int(there[0]['won']) + int(there[0]['lost'])}"
+            if there else
+            ("there nothing has worked yet" + (f"; untried there: {', '.join(opened[:6])}" if opened else ""))
+        )
+        keys = [str(rule.get("key"))] + [
+            str(a.get("key")) for a in (rule.get("alternatives") or []) if isinstance(a, Mapping)
+        ]
+        return {
+            "mode": "conditional",
+            "suggested_action": None,
+            "contested": evidence,
+            "rule": {"key": rule.get("key"), "fails_when": rule.get("fails_when"),
+                     "works_when": rule.get("works_when"),
+                     "alternatives": list(rule.get("alternatives") or []),
+                     "then": str(there[0]["action_key"]) if there else None,
+                     "else": action},
+            "untried": opened,
+            "why": (
+                f"{split_text}; {there_text}. Check {' and '.join(keys)} for this task before acting: "
+                f"where {works_when} take {action}, where {fails_when} "
+                + (f"take {there[0]['action_key']}" if there else "take an untried action, not " + action)
+                + ("; where they disagree, weigh the cases" if len(keys) > 1 else "")
+            ),
+        }
+    if lost < CONTESTED_MIN_SIDE:
+        return None
+    # Contested with no covariate the record splits on: the agent weighs the
+    # cases; the contested action is not what the record recommends.
+    there = [r for r in side_record if int(r.get("won", 0)) >= 1
+             and (allowed is None or str(r["action_key"]) in allowed)]
+    opened = _open(side_record)
+    if there:
+        best = there[0]
+        n = int(best["won"]) + int(best["lost"])
+        pick: str | None = str(best["action_key"])
+        tail = f"since then {best['action_key']} won {best['won']}/{n} here"
+    else:
+        pick = opened[stable_bucket(agent_id, len(opened))] if opened else None
+        tail = (f"untried here since: {', '.join(opened[:6])}" if opened else "every candidate has been tried since")
+    return {
+        "mode": "explore",
+        "suggested_action": pick,
+        "untried": opened,
+        "contested": evidence,
+        "why": (
+            f"{action} won {before} times on this situation before {when}; since then it won {won} and "
+            f"lost {lost}, and the record has no covariate that separates them — the fix now depends on "
+            f"something about the task. Compare the cases below with this task before acting; {tail}"
+        ),
+    }
 
 
 def _recommend_mode(
@@ -1283,6 +1890,25 @@ def plan_actions(
 
     if recommendation and recommendation.get("mode") in ("act", "explore"):
         _add(recommendation.get("suggested_action"))
+    elif recommendation and recommendation.get("mode") == "conditional":
+        # The record split on a covariate this task did not declare: the
+        # plan opens with the rule's two branches — what wins on the failing
+        # side first, since that is the side the record is contested on,
+        # then the contested action where it still works — never with the
+        # contested action's lifetime record, which is what the rule retires.
+        rule = recommendation.get("rule") if isinstance(recommendation.get("rule"), Mapping) else {}
+        opened = list(recommendation.get("untried") or [])
+        if rule.get("then"):
+            _add(rule.get("then"))
+            _add(rule.get("else"))
+        else:
+            # Nothing has won on the failing side yet: its untried come before
+            # the contested action, as the explore there would order them.
+            for a in opened[stable_bucket(agent_id, len(opened)):] + opened[:stable_bucket(agent_id, len(opened))]:
+                _add(a)
+            _add(rule.get("else"))
+        for a in opened:
+            _add(a)
     by_p = sorted(tried, key=lambda t: (-float(t.get("p", 0)), -int(t.get("n", 0))))
     losers = [
         t for t in by_p
@@ -1376,6 +2002,12 @@ def rank_by_lessons(
         (worked if claim.get("worked") else failed).add(action)
     failed -= worked
     worked = {a for a in worked if not (a in tried and _stopped_working(tried[a]))}
+    # The same for the action a contest is about: its record on this
+    # situation is split, and a lesson that it worked here was written on
+    # one side of the split. The record is newer than the lesson's words.
+    contest = (recommendation or {}).get("contested")
+    contested_action = str(contest.get("action") or "") if isinstance(contest, Mapping) else ""
+    worked.discard(contested_action)
     if not worked and not failed:
         return order
     head: list[str] = []
@@ -1383,6 +2015,15 @@ def rank_by_lessons(
     suggested = str((recommendation or {}).get("suggested_action") or "")
     if mode == "act" and suggested in order and suggested not in failed:
         head.append(suggested)
+    elif mode == "conditional":
+        # The plan opened with the rule's branches (:func:`plan_actions`);
+        # what won on the failing side stays at the head the way an ``act``
+        # recommendation does, since that is the side the record is
+        # contested on.
+        rule = (recommendation or {}).get("rule")
+        then = str(rule.get("then") or "") if isinstance(rule, Mapping) else ""
+        if then and then in order and then not in failed:
+            head.append(then)
     front = [a for a in order if a in worked and a not in head]
     back = [a for a in order if a in failed]
     middle = [a for a in order if a not in head and a not in worked and a not in failed]
@@ -1601,6 +2242,69 @@ def _act_from_contrast(
     return None
 
 
+def _case_text(case: Mapping[str, Any]) -> str:
+    """One evidence case: ``plan=pro, app_major=9 -> lost (resolved with X)``."""
+    cv = case.get("covariates") or {}
+    facts = ", ".join(f"{k}={v}" for k, v in list(cv.items())[:6]) or "no covariates declared"
+    text = f"{facts} -> {case.get('outcome')}"
+    if case.get("resolved_with"):
+        text += f" (resolved with {case['resolved_with']})"
+    return text
+
+
+def render_contested(contested: Mapping[str, Any]) -> list[str]:
+    """The lines the footer shows for a contested rule: what split, or the
+    cases side by side when nothing did, or the first strike. The cases are
+    the evidence an agent weighs when the record cannot — the old and the
+    new outcomes of the same action, with what each task was like."""
+    action = str(contested.get("action"))
+    before = int(contested.get("won_before") or 0)
+    won = int(contested.get("won_since") or 0)
+    lost = int(contested.get("lost_since") or 0)
+    when = _when(contested.get("since"))
+    cases = list(contested.get("cases") or [])
+    rule = contested.get("rule") if isinstance(contested.get("rule"), Mapping) else None
+    lines: list[str] = []
+    if rule is not None:
+        fails_when, works_when = describe_rule(rule)
+        failing, working = rule.get("failing") or {}, rule.get("working") or {}
+        line = (
+            f"Contested since {when}: {action} still works where {works_when} "
+            f"({int(working.get('won', 0))}/{int(working.get('won', 0)) + int(working.get('lost', 0))}) "
+            f"but has failed where {fails_when} ({int(failing.get('lost', 0))} lost / "
+            f"{int(failing.get('won', 0))} won)."
+        )
+        side = [r for r in (contested.get("side_record") or []) if r.get("action_key")]
+        wins = [r for r in side if int(r.get("won", 0)) >= 1]
+        if wins:
+            line += " On the failing side: " + "; ".join(
+                f"{r['action_key']} {r['won']}/{int(r['won']) + int(r['lost'])}" for r in wins[:3]
+            ) + "."
+        elif side:
+            line += " On the failing side nothing has worked yet: " + "; ".join(
+                f"{r['action_key']} 0/{int(r['lost'])}" for r in side[:4]
+            ) + "."
+        else:
+            line += " On the failing side nothing else has been tried yet."
+        lines.append(line)
+        return lines
+    if lost >= CONTESTED_MIN_SIDE:
+        lines.append(
+            f"Contested since {when}: {action} won {before} times on this situation before, "
+            f"then won {won} and lost {lost} — the fix now depends on something about the task "
+            f"the record has not split on. Cases, newest first: "
+            + " | ".join(_case_text(c) for c in cases[:CONTESTED_CASES]) + "."
+        )
+        return lines
+    if lost == 1 and cases:
+        first = next((c for c in cases if c.get("outcome") == "lost"), cases[0])
+        lines.append(
+            f"{action} has worked {before} times on this situation and failed once ({when}: "
+            f"{_case_text(first)}) — one loss is not a change; if this task resembles that one, weigh it."
+        )
+    return lines
+
+
 def render_priors(
     priors: Mapping[str, Any] | None,
     recommendation: Mapping[str, Any] | None,
@@ -1673,6 +2377,9 @@ def render_priors(
         lines.append(("Tried on this situation: " if exact else "Tried on similar tasks here: ") + "; ".join(parts))
     elif exact:
         lines.append("No outcome recorded for this situation yet.")
+    contested = (priors or {}).get("contested") if exact else None
+    if isinstance(contested, Mapping) and contested.get("action"):
+        lines.extend(render_contested(contested))
     nearby = (priors or {}).get("nearby") if exact else None
     if isinstance(nearby, Mapping) and nearby.get("by_situation"):
         groups = []

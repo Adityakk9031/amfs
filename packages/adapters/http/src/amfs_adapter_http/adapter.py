@@ -438,6 +438,11 @@ class HttpAdapter(AdapterABC):
             body["actions_taken"] = list(record.actions_taken)
         if record.entity_paths:
             body["entity_paths"] = list(record.entity_paths)
+        # The task's covariates, declared: their own field, so the server
+        # splits a contested situation on what the run said the task was like
+        # and not on the bag's bookkeeping.
+        if record.covariates:
+            body["covariates"] = dict(record.covariates)
         if record.situation:
             body["situation"] = record.situation
         data = self._post("/api/v1/outcomes", body)
@@ -552,6 +557,7 @@ class HttpAdapter(AdapterABC):
         compact: bool | None = None,
         environment: Mapping[str, Any] | None = None,
         abstain: bool | None = None,
+        covariates: Mapping[str, Any] | None = None,
     ) -> list[tuple[MemoryEntry, float, dict[str, Any]]]:
         """Server-side semantic retrieval via POST /api/v1/retrieve.
 
@@ -605,6 +611,13 @@ class HttpAdapter(AdapterABC):
             body["environment"] = {k: str(v) for k, v in environment.items() if v}
         if abstain is not None:
             body["abstain"] = abstain
+        if covariates:
+            # What this task is like, so a contested situation's conditional
+            # rule can be read for it (``amfs_core.actions.split_contested``).
+            body["covariates"] = {
+                str(k): v for k, v in covariates.items()
+                if isinstance(v, (bool, int, float, str))
+            }
         data = self._post("/api/v1/retrieve", body)
         self._capture_reuse_value()
         rows = data if isinstance(data, list) else data.get("entries", [])

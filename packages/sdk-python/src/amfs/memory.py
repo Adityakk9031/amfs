@@ -467,6 +467,10 @@ class AgentMemory:
         # Buffered separately from ``_session_metadata`` — which callers (and the
         # MCP server) reassign wholesale — and merged into it at commit time.
         self._session_attributes: dict[str, str | int | float | bool] = {}
+        # What this task is like, as declared (``declare_covariates`` /
+        # ``Run.observe``): carried on the outcome record as its own block,
+        # apart from the bag's bookkeeping, and cleared with the bag.
+        self._covariates: dict[str, str | int | float | bool] = {}
         self._session_llm_calls: list[dict[str, Any]] = []
 
         self._lifecycle: LifecycleManager | None = None
@@ -507,6 +511,7 @@ class AgentMemory:
         keys under the cap ahead of what a run set — the replay receiver's
         grader keys, say."""
         self._session_attributes = {}
+        self._covariates = {}
         self._declare_situation()
 
     @property
@@ -1044,6 +1049,7 @@ class AgentMemory:
         branch: str | None = None,
         environment: Mapping[str, Any] | None = None,
         abstain: bool = False,
+        covariates: Mapping[str, Any] | None = None,
     ) -> list[ScoredEntry]:
         """Rank memories by meaning for a natural-language query.
 
@@ -1060,9 +1066,12 @@ class AgentMemory:
         and how it went, plus a recommendation — ``act`` / ``explore`` /
         ``escalate`` — read afterwards from :attr:`last_priors`. Pass the
         actions you could take as ``candidate_actions`` (``tool:action`` keys)
-        so it can name the untried ones; ``situation`` labels the kind of task.
-        ``compact=True`` trims each hit to the fields an agent acts on. Both are
-        server-side features; the local adapters return entries without them.
+        so it can name the untried ones; ``situation`` labels the kind of task;
+        ``covariates`` says what this task is like (``{"plan": "pro"}``), so a
+        situation whose record has split on one of them is read for this
+        task rather than served as contested. ``compact=True`` trims each hit
+        to the fields an agent acts on. All are server-side features; the
+        local adapters return entries without them.
 
         *branch* defaults to the active branch (``checkout``), so an agent on
         a repair branch retrieves what that branch says, not what ``main`` does.
@@ -1096,6 +1105,8 @@ class AgentMemory:
                     extra["environment"] = env
                 if abstain:
                     extra["abstain"] = True
+                if covariates:
+                    extra["covariates"] = dict(covariates)
                 # Sent only off the default: every adapter's retrieve defaults
                 # to main, and an older one without the keyword would otherwise
                 # raise TypeError here and fall back to local scoring for every
@@ -1124,7 +1135,7 @@ class AgentMemory:
                         "adaptive_k": cfg.adaptive_k,
                         **extra,
                     },
-                    optional=("environment", "abstain", "branch", "situation",
+                    optional=("covariates", "environment", "abstain", "branch", "situation",
                               "compact", "candidate_actions", "include_priors"),
                 )
                 scored = [
@@ -1554,6 +1565,7 @@ class AgentMemory:
         actions_taken: list[dict[str, Any]] | None = None,
         verified_by: str | None = None,
         evidence: Mapping[str, Any] | None = None,
+        covariates: Mapping[str, Any] | None = None,
     ) -> list[MemoryEntry]:
         """Record an outcome and back-propagate confidence changes.
 
@@ -1752,6 +1764,10 @@ class AgentMemory:
             actions_taken=actions_taken,
             entity_paths=entity_paths,
             situation=situation,
+            # The task's covariates as declared, their own block on the record:
+            # the server splits a contested situation on them and must not
+            # mistake the bag's bookkeeping for one.
+            covariates=dict(covariates) if covariates is not None else dict(self._covariates),
         )
         updated = self._propagator.propagate(record)
         self._write_contrast_lesson(record)
@@ -1915,6 +1931,7 @@ class AgentMemory:
         # process start rather than describing the work it covers.
         self._read_tracker.clear()
         self._session_attributes = {}
+        self._covariates = {}
         self._session_llm_calls = []
         self._declare_situation()
         return updated
@@ -2147,6 +2164,44 @@ class AgentMemory:
         if SITUATION_ATTRIBUTE in validated:
             self._declare_situation()
         return dict(self._session_attributes)
+
+    def declare_covariates(self, covariates: Mapping[str, Any]) -> dict[str, Any]:
+        """Declare what this task is like — the customer's plan, the app
+        version a lookup showed, the card's issuer — as covariates on the
+        outcome and on the record's view of it. Scalars only; keys folded to
+        lower case; the run's environment keys and ``situation`` are not
+        covariates and raise. They also go on the session attribute bag, so a
+        server that reads only the bag still sees them. Returns the covariates
+        as they now stand. ``Run.observe`` is the usual way in."""
+        clean: dict[str, str | int | float | bool] = {}
+        for key, value in dict(covariates).items():
+            k = str(key).strip().lower()
+            if not k:
+                continue
+            if k in ENVIRONMENT_KEYS or k == SITUATION_ATTRIBUTE:
+                raise ValueError(f"{k!r} is the run's environment, not a covariate")
+            if not isinstance(value, (bool, int, float, str)):
+                raise TypeError(f"covariate {k!r} must be a scalar, got {type(value).__name__}")
+            clean[k] = value
+        if clean:
+            self.set_session_attributes(clean)
+            self._covariates.update(clean)
+        return dict(self._covariates)
+
+    @property
+    def covariates(self) -> dict[str, Any]:
+        """The covariates declared so far this session."""
+        return dict(self._covariates)
+
+    def clear_covariates(self) -> None:
+        """Drop the covariates declared so far — from the block and from the
+        bag — without touching the rest of the bag. ``Run.begin`` calls it:
+        a run that observed and never committed must not tag the next run's
+        outcome with the previous task's plan, which would put it on the
+        wrong side of a contested split. The commit clears them itself."""
+        for key in self._covariates:
+            self._session_attributes.pop(key, None)
+        self._covariates = {}
 
     def _declare_situation(self) -> None:
         """Tell the adapter the situation the bag now carries, when it can
