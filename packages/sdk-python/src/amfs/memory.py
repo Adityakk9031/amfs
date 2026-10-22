@@ -1044,6 +1044,7 @@ class AgentMemory:
         branch: str | None = None,
         environment: Mapping[str, Any] | None = None,
         abstain: bool = False,
+        covariates: Mapping[str, Any] | None = None,
     ) -> list[ScoredEntry]:
         """Rank memories by meaning for a natural-language query.
 
@@ -1060,9 +1061,12 @@ class AgentMemory:
         and how it went, plus a recommendation — ``act`` / ``explore`` /
         ``escalate`` — read afterwards from :attr:`last_priors`. Pass the
         actions you could take as ``candidate_actions`` (``tool:action`` keys)
-        so it can name the untried ones; ``situation`` labels the kind of task.
-        ``compact=True`` trims each hit to the fields an agent acts on. Both are
-        server-side features; the local adapters return entries without them.
+        so it can name the untried ones; ``situation`` labels the kind of task;
+        ``covariates`` says what this task is like (``{"plan": "pro"}``), so a
+        situation whose record has split on one of them is read for this
+        task rather than served as contested. ``compact=True`` trims each hit
+        to the fields an agent acts on. All are server-side features; the
+        local adapters return entries without them.
 
         *branch* defaults to the active branch (``checkout``), so an agent on
         a repair branch retrieves what that branch says, not what ``main`` does.
@@ -1096,6 +1100,8 @@ class AgentMemory:
                     extra["environment"] = env
                 if abstain:
                     extra["abstain"] = True
+                if covariates:
+                    extra["covariates"] = dict(covariates)
                 # Sent only off the default: every adapter's retrieve defaults
                 # to main, and an older one without the keyword would otherwise
                 # raise TypeError here and fall back to local scoring for every
@@ -1124,7 +1130,7 @@ class AgentMemory:
                         "adaptive_k": cfg.adaptive_k,
                         **extra,
                     },
-                    optional=("environment", "abstain", "branch", "situation",
+                    optional=("covariates", "environment", "abstain", "branch", "situation",
                               "compact", "candidate_actions", "include_priors"),
                 )
                 scored = [

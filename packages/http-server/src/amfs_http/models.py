@@ -185,6 +185,11 @@ class RetrieveRequest(BaseModel):
     #: What kind of task this is, embedded for the priors' nearest-neighbour
     #: lookup in place of the query when given.
     situation: str | None = None
+    #: What this task is like, as scalars (``{"plan": "pro"}``). When the
+    #: situation's record has split on one of them — the old action still
+    #: wins on one side and lost on the other — the recommendation is read
+    #: for this task's side instead of served as contested.
+    covariates: dict[str, Any] | None = None
     #: Return the fields an agent acts on and drop the bookkeeping (score
     #: breakdown, importance dimensions, integrity fields, long values trimmed).
     #: Roughly a third of the tokens of the full payload.

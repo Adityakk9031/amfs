@@ -647,6 +647,15 @@ class OutcomeRecord(BaseModel):
     #: Optional caller label for the kind of situation ("card-declined ticket"),
     #: stored verbatim for analysis; similarity itself comes from ``task_input``.
     situation: str | None = None
+    #: What the task was like, as scalars the run declared about it (the
+    #: customer's plan, the app version a lookup showed, the card's issuer
+    #: country) — ``Run.begin(covariates=...)`` / ``set_session_attributes``.
+    #: Distinct from the run's own environment. Persisted on the outcome row
+    #: so a contested situation's record can be split by what separates the
+    #: runs an action still wins from the ones it lost
+    #: (``amfs_core.actions.split_contested``). Defaults to the session
+    #: attributes less the environment keys and the situation.
+    covariates: dict[str, Any] = Field(default_factory=dict)
     #: Captured prompt and response, carried alongside the outcome rather than
     #: only on the trace. On the SaaS path the adapter's ``commit_outcome`` is what
     #: reaches the server, and the server seals its immutable trace from that call

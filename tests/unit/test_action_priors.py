@@ -2450,3 +2450,312 @@ def test_recommend_thresholds_are_keywords_defaulting_to_the_constants() -> None
     # is unaffected by either threshold — the gate is for pooled records.
     exact = {"tried": [dict(_prior("resolve:b", 1, 1, ["won"]), situation_exact=True)], "untried": ["resolve:c"]}
     assert act.recommend(exact, agent_id="x", candidate_actions=cands, min_p=0.99, min_n=50)["mode"] == "act"
+
+
+# ── situation identity (amfs_core.situations) ───────────────────────────────
+
+
+def test_situation_identity_joins_an_added_qualifier_and_never_a_swapped_token() -> None:
+    """The record is partitioned by situation and planned from, so the rule
+    that joins two spellings is precision-first: a label with a qualifier
+    added is the same situation; a label with one token swapped is another
+    class however much it shares. Measured on 24 cells of the regime studies
+    (2026-10-22): purity 1.000, no mixed cluster, the situation's record
+    non-empty on 81 % of first searches after a change (exact labels 55 %)."""
+    from amfs_core.situations import canonicalize, fold, resolve, same_situation
+
+    f = fold
+    # Fold: case, punctuation, noise words, word order.
+    assert f("Card-Declined ticket") == f("declined card") == "card declined"
+    # Added qualifiers join (containment of every token, two or more shared).
+    assert same_situation(f("csv export timeout"), f("csv export timeout web"))
+    assert same_situation(f("csv export timeout"), f("android csv export timeout web pro plan"))
+    assert same_situation(f("pip audit pinned dependency failure"), f("pip audit pinned dependencies"))
+    # A swapped token is another class — the ops-queue pair, and platforms.
+    assert not same_situation(f("jest snapshot · UI PR"), f("jest snapshot · backend-only PR"))
+    assert not same_situation(f("jest snapshot UI PR"), f("jest snapshot backend PR"))
+    assert not same_situation(f("ios login loop"), f("android login loop"))
+    # Synonyms with no stem in common are for the hosted resolver.
+    assert not same_situation(f("csv export timeout"), f("data export failure web"))
+    # Canonicals: oldest first, first spelling wins, a later one never re-homes.
+    labels = [f("csv export timeout"), f("csv export timeout web"), f("data export failure web"),
+              f("web csv export timeout android")]
+    ident = canonicalize(labels)
+    assert ident[f("csv export timeout web")] == "csv export timeout"
+    assert ident[f("web csv export timeout android")] == "csv export timeout"
+    assert ident[f("data export failure web")] == "data export web"
+    # Resolving a declared label: its own canonical, the nearest, or itself.
+    assert resolve(f("csv export timeout android"), ident) == "csv export timeout"
+    assert resolve(f("webhook delivery delay"), ident) == "delay delivery webhook"
+    # The resolver is the second stage: asked only when the token rule has nothing.
+    seen: list[str] = []
+
+    def synonyms(label, canonicals):
+        seen.append(label)
+        return "csv export timeout" if "export" in label else None
+
+    assert resolve(f("export timeouts on the web"), ident, resolver=synonyms) == "csv export timeout"
+    assert resolve(f("csv export timeout ios"), ident, resolver=synonyms) == "csv export timeout"
+    assert seen == [f("export timeouts on the web")]
+
+
+def test_the_situations_own_record_is_read_by_identity_not_by_spelling(client, server_mem) -> None:
+    """An agent spells one situation many ways (14 per class per cell on the
+    2026-10-21 regime study); compared as strings the record was non-empty
+    on 37 % of first searches and the recommendation abstained on 70 %. Rows
+    under the spellings the rule joins are the declared situation's own
+    record; a swapped-token class stays a neighbour; the record says what it
+    was read as."""
+    from amfs_http import server
+
+    rows = [
+        _sit_row("csv export timeout", [("resolve:advise_workaround", True)], days_ago=3),
+        _sit_row("CSV export timeout (web)", [("resolve:advise_workaround", True)], days_ago=2),
+        _sit_row("csv export timeout android pro plan", [("resolve:advise_workaround", False)],
+                 outcome="failure", days_ago=1),
+        _sit_row("jest snapshot backend PR", [("fix:fix_code", True)], days_ago=1),
+    ]
+    server_mem._adapter.similar_outcomes = lambda entity_path, embedding, **kw: []  # type: ignore[attr-defined]
+    _stub_stats(server_mem._adapter, rows)
+    server._get_server_embedder = lambda: _StubEmbedder()
+    cands = ["resolve:advise_workaround", "resolve:advise_settings_change", "fix:fix_code"]
+    body = {"query": "export", "entity_path": "acme/support", "include_priors": True,
+            "agent_id": "a9", "candidate_actions": cands, "abstain": True}
+    meta = client.post("/api/v1/retrieve", json=dict(body, situation="web csv export timeout")).json()[-1]
+    pr = meta["priors"]
+    assert pr["situation_record"]["outcomes"] == 3
+    assert pr["situation_record"]["canonical"] == "csv export timeout"
+    assert pr["situation_record"]["spellings"] == 3
+    assert pr["situation_record"]["situation"] == "web csv export timeout"
+    tried = {t["action_key"]: (t["won"], t["lost"]) for t in pr["tried"]}
+    assert tried == {"resolve:advise_workaround": (2, 1)}
+    assert meta["recommendation"]["mode"] != "abstain"
+    # The swapped-token class is not this record; it is reported elsewhere.
+    assert {t["action_key"] for t in pr["elsewhere"]["tried"]} == {"fix:fix_code"}
+    # A class the record has not seen, under any spelling, still abstains.
+    meta = client.post("/api/v1/retrieve", json=dict(body, situation="jest snapshot UI PR")).json()[-1]
+    assert meta["priors"]["situation_record"]["outcomes"] == 0
+    assert "canonical" not in meta["priors"]["situation_record"]
+    assert meta["recommendation"]["mode"] == "abstain"
+    # A hosted resolver joins the synonyms the token rule cannot, and only those.
+    server.set_situation_resolver(lambda label, canonicals: "csv export timeout" if "export" in label else None)
+    try:
+        meta = client.post("/api/v1/retrieve", json=dict(body, situation="data export failure")).json()[-1]
+        assert meta["priors"]["situation_record"]["outcomes"] == 3
+        assert meta["priors"]["situation_record"]["canonical"] == "csv export timeout"
+    finally:
+        server.set_situation_resolver(None)
+
+
+# ── a contested rule: the record split by what the task was like ───────────
+
+
+def _cov_row(action, ok, covariates, *, minutes_ago, resolved_with=None):
+    """One outcome on the situation: *action* taken (won or lost), the task's
+    covariates recorded, and — when the action lost — what solved it."""
+    acts = [{"action_key": action, "success": ok}]
+    if not ok and resolved_with:
+        acts[0]["attempt"] = 1
+        acts.append({"action_key": resolved_with, "success": True})
+    return {
+        "actions_taken": acts,
+        "outcome_type": "success" if (ok or resolved_with) else "failure",
+        "committed_at": datetime.now(UTC) - timedelta(minutes=minutes_ago),
+        "agent_id": "beam",
+        "situation": "export timeout",
+        "covariates": covariates,
+        "outcome_ref": f"ep-{minutes_ago}",
+    }
+
+
+def _set_c_export_record():
+    """Change set C on export-timeout: ``advise_workaround`` kept working on
+    the free plan and stopped on pro/team, where ``advise_settings_change``
+    solves it. Oldest first: three wins before the change, then pro and
+    team losses interleaved with free wins."""
+    old, new = "resolve:advise_workaround", "resolve:advise_settings_change"
+    return [
+        _cov_row(old, True, {"plan": "team", "device": "web", "app_major": 9}, minutes_ago=90),
+        _cov_row(old, True, {"plan": "free", "device": "iOS", "app_major": 8}, minutes_ago=80),
+        _cov_row(old, True, {"plan": "pro", "device": "web", "app_major": 9}, minutes_ago=70),
+        _cov_row(old, False, {"plan": "pro", "device": "Android", "app_major": 8}, minutes_ago=60, resolved_with=new),
+        _cov_row(old, True, {"plan": "free", "device": "web", "app_major": 9}, minutes_ago=50),
+        _cov_row(old, False, {"plan": "team", "device": "iOS", "app_major": 9}, minutes_ago=40, resolved_with=new),
+        _cov_row(old, True, {"plan": "free", "device": "Android", "app_major": 8}, minutes_ago=30),
+        _cov_row(old, False, {"plan": "pro", "device": "web", "app_major": 9}, minutes_ago=20, resolved_with=new),
+    ]
+
+
+def test_a_contested_action_is_split_on_the_covariate_that_separates_its_losses() -> None:
+    """Set C's shape: wins and losses interleave, so no streak forms and the
+    lifetime record (5/8) still reads as a winner. The contest is dated from
+    the first loss; the plan separates every loss since from every win —
+    ``plan in {pro, team}`` fails, ``plan = free`` works — and the cases
+    carry the covariates, old wins beside new losses."""
+    cb = act.contested_record(_set_c_export_record())
+    assert cb is not None and cb["action"] == "resolve:advise_workaround"
+    assert (cb["won_before"], cb["won_since"], cb["lost_since"]) == (3, 2, 3)
+    rule = cb["rule"]
+    assert rule["key"] == "plan" and sorted(rule["fails_when"]) == ["pro", "team"]
+    assert rule["works_when"] == ["free"]
+    assert rule["failing"] == {"won": 0, "lost": 3}
+    # Working side: the two free wins since plus the free win before.
+    assert rule["working"] == {"won": 3, "lost": 0}
+    assert "alternatives" not in rule
+    fails, works = act.describe_rule(rule)
+    assert fails == "plan in {pro, team}" and works == "plan = free"
+    assert cb["side_record"] == [{"action_key": "resolve:advise_settings_change", "won": 3, "lost": 0}]
+    assert len(cb["cases"]) == 6 and cb["cases"][0]["outcome"] == "lost"
+    assert cb["cases"][0]["covariates"]["plan"] == "pro"
+    assert cb["cases"][0]["resolved_with"] == "resolve:advise_settings_change"
+
+
+def test_a_numeric_covariate_splits_on_a_threshold() -> None:
+    old, new = "resolve:advise_settings_change", "resolve:reinstall_app"
+    rows = [
+        _cov_row(old, True, {"app_major": 8}, minutes_ago=80),
+        _cov_row(old, True, {"app_major": 9}, minutes_ago=70),
+        _cov_row(old, False, {"app_major": 9}, minutes_ago=60, resolved_with=new),
+        _cov_row(old, True, {"app_major": 8}, minutes_ago=50),
+        _cov_row(old, False, {"app_major": 9}, minutes_ago=40, resolved_with=new),
+        _cov_row(old, True, {"app_major": 8}, minutes_ago=30),
+    ]
+    rule = act.contested_record(rows)["rule"]
+    assert rule["key"] == "app_major" and rule["fails_when"] == {">=": 9} and rule["works_when"] == {"<": 9}
+    assert act._rule_applies(rule, {"app_major": 10}) is True
+    assert act._rule_applies(rule, {"app_major": 8}) is False
+    assert act._rule_applies(rule, {"plan": "pro"}) is None
+
+
+def test_a_clean_turn_yields_no_rule_however_the_losses_agree() -> None:
+    """W W W W L L L L, every loss on Android by chance (the study's
+    card-declined cells read the issuer's change as the device's). No win
+    since the first loss means no covariate has been *seen* to matter; the
+    turn is left to the streak logic and no rule is declared."""
+    old = "resolve:escalate_tier2"
+    rows = [
+        _cov_row(old, True, {"issuer": "US", "device": "iOS"}, minutes_ago=90),
+        _cov_row(old, True, {"issuer": "BR", "device": "web"}, minutes_ago=80),
+        _cov_row(old, True, {"issuer": "US", "device": "web"}, minutes_ago=70),
+        _cov_row(old, True, {"issuer": "MX", "device": "iOS"}, minutes_ago=60),
+        _cov_row(old, False, {"issuer": "US", "device": "Android"}, minutes_ago=40),
+        _cov_row(old, False, {"issuer": "US", "device": "Android"}, minutes_ago=30),
+        _cov_row(old, False, {"issuer": "US", "device": "Android"}, minutes_ago=20),
+    ]
+    assert act.contested_record(rows) is None
+    pr = act.aggregate_priors(rows, situation_exact=True)
+    assert "contested" not in pr
+
+
+def test_two_keys_that_split_the_record_alike_are_carried_as_alternatives() -> None:
+    """Two losses and one win since: the plan and the issuer both separate
+    them. Neither is declared *the* rule; a task they put on different sides
+    is not read as either, and the agent is told to check both."""
+    old = "resolve:advise_workaround"
+    rows = [
+        _cov_row(old, True, {"plan": "free", "issuer": "US"}, minutes_ago=80),
+        _cov_row(old, True, {"plan": "free", "issuer": "GB"}, minutes_ago=70),
+        _cov_row(old, False, {"plan": "pro", "issuer": "JP"}, minutes_ago=60),
+        _cov_row(old, True, {"plan": "free", "issuer": "US"}, minutes_ago=50),
+        _cov_row(old, False, {"plan": "pro", "issuer": "JP"}, minutes_ago=40),
+    ]
+    rule = act.contested_record(rows)["rule"]
+    keys = {rule["key"]} | {a["key"] for a in rule["alternatives"]}
+    assert keys == {"plan", "issuer"}
+    assert act._rule_applies(rule, {"plan": "pro", "issuer": "JP"}) is True
+    assert act._rule_applies(rule, {"plan": "free", "issuer": "US"}) is False
+    assert act._rule_applies(rule, {"plan": "pro", "issuer": "US"}) is None
+    fails, _ = act.describe_rule(rule)
+    assert "cannot yet tell which" in fails
+    rec = act.recommend(
+        act.aggregate_priors(rows, situation_exact=True) | {"situation_record": {"situation": "x", "outcomes": 5}},
+        agent_id="a", candidate_actions=[old, "resolve:refund"], covariates={"plan": "pro", "issuer": "US"},
+    )
+    assert rec["mode"] == "conditional"
+    assert "Check issuer and plan" in rec["why"] and "where they disagree, weigh the cases" in rec["why"]
+
+
+def test_the_recommendation_reads_a_contested_rule_for_the_asking_tasks_side() -> None:
+    """The one change the study asked for. On the working side the
+    contested action is still ``act``; on the failing side the record says
+    what has won there and never the contested action; without the
+    covariate the mode is ``conditional`` and the agent checks it."""
+    rows = _set_c_export_record()
+    old, new = "resolve:advise_workaround", "resolve:advise_settings_change"
+    cands = [old, new, "resolve:refund"]
+    pr = act.aggregate_priors(rows, candidate_actions=cands, situation_exact=True)
+    pr["situation_record"] = {"situation": "export timeout", "outcomes": len(rows)}
+
+    kept = act.recommend(pr, agent_id="a", candidate_actions=cands, covariates={"plan": "free"})
+    assert kept["mode"] == "act" and kept["suggested_action"] == old
+    assert "where it works" in kept["why"] and kept["contested"]["rule"]["key"] == "plan"
+
+    moved = act.recommend(pr, agent_id="a", candidate_actions=cands, covariates={"plan": "team"})
+    assert moved["mode"] == "act" and moved["suggested_action"] == new
+    assert "failing side" in moved["why"] and moved["plan"][0] == new
+
+    unknown = act.recommend(pr, agent_id="a", candidate_actions=cands)
+    assert unknown["mode"] == "conditional" and unknown["suggested_action"] is None
+    assert unknown["rule"]["then"] == new and unknown["rule"]["else"] == old
+    assert "Check plan" in unknown["why"]
+
+    # A failing side where nothing has won yet: explore the untried there,
+    # never the contested action.
+    bare = [r for r in rows if r["actions_taken"][0]["success"]] + [
+        _cov_row(old, False, {"plan": "pro"}, minutes_ago=25),
+        _cov_row(old, False, {"plan": "team"}, minutes_ago=15),
+    ]
+    pr2 = act.aggregate_priors(bare, candidate_actions=cands, situation_exact=True)
+    pr2["situation_record"] = {"situation": "export timeout", "outcomes": len(bare)}
+    rec = act.recommend(pr2, agent_id="a", candidate_actions=cands, covariates={"plan": "pro"})
+    assert rec["mode"] == "explore" and rec["suggested_action"] != old
+    assert rec["suggested_action"] in {new, "resolve:refund"} and old not in rec["untried"]
+
+
+def test_the_footer_shows_the_contest_the_rule_and_the_cases() -> None:
+    rows = _set_c_export_record()
+    old, new = "resolve:advise_workaround", "resolve:advise_settings_change"
+    pr = act.aggregate_priors(rows, candidate_actions=[old, new], situation_exact=True)
+    pr["situation_record"] = {"situation": "export timeout", "outcomes": len(rows)}
+    text = act.render_priors(pr, act.recommend(pr, agent_id="a", covariates={"plan": "team"}), agent_id="a")
+    assert "Contested since" in text
+    assert (
+        f"{old} still works where plan = free (3/3) but has failed where plan in {{pro, team}} "
+        "(3 lost / 0 won)"
+    ) in text
+    assert f"On the failing side: {new} 3/3" in text
+    # Without a rule the cases themselves are served, covariates and all.
+    norule = [
+        _cov_row(old, True, {}, minutes_ago=80),
+        _cov_row(old, True, {}, minutes_ago=70),
+        _cov_row(old, False, {}, minutes_ago=60, resolved_with=new),
+        _cov_row(old, True, {}, minutes_ago=50),
+        _cov_row(old, False, {}, minutes_ago=40, resolved_with=new),
+    ]
+    pr2 = act.aggregate_priors(norule, candidate_actions=[old, new], situation_exact=True)
+    pr2["situation_record"] = {"situation": "export timeout", "outcomes": len(norule)}
+    rec2 = act.recommend(pr2, agent_id="a", candidate_actions=[old, new])
+    assert rec2["mode"] == "explore" and rec2["suggested_action"] == new
+    text2 = act.render_priors(pr2, rec2, agent_id="a")
+    assert "the record has not split on. Cases, newest first:" in text2
+    assert f"no covariates declared -> lost (resolved with {new})" in text2
+    # The first strike is shown as what it is — one loss — and the contested
+    # branch decides nothing on it: the reading is the record's own (here
+    # the contrast on the newest take, which resolved with ``new``).
+    strike = norule[:3]
+    pr3 = act.aggregate_priors(strike, candidate_actions=[old, new], situation_exact=True)
+    pr3["situation_record"] = {"situation": "export timeout", "outcomes": 3}
+    assert pr3["contested"]["lost_since"] == 1
+    rec3 = act.recommend(pr3, agent_id="a", candidate_actions=[old, new])
+    assert "contested" not in rec3
+    assert "failed once" in act.render_priors(pr3, rec3, agent_id="a")
+
+
+def test_covariates_are_dropped_from_a_label_but_a_label_of_only_covariates_keeps_them() -> None:
+    from amfs_core.situations import fold
+
+    cov = {"plan": "team", "device": "Android"}
+    assert fold("Android card declined, plan team", cov) == "card declined"
+    assert fold("card declined", cov) == fold("android card declined plan team", cov)
+    assert fold("Android team", cov) == "android team"
+    assert fold("card declined") == "card declined"

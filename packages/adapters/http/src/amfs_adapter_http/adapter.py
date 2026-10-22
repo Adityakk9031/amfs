@@ -552,6 +552,7 @@ class HttpAdapter(AdapterABC):
         compact: bool | None = None,
         environment: Mapping[str, Any] | None = None,
         abstain: bool | None = None,
+        covariates: Mapping[str, Any] | None = None,
     ) -> list[tuple[MemoryEntry, float, dict[str, Any]]]:
         """Server-side semantic retrieval via POST /api/v1/retrieve.
 
@@ -605,6 +606,13 @@ class HttpAdapter(AdapterABC):
             body["environment"] = {k: str(v) for k, v in environment.items() if v}
         if abstain is not None:
             body["abstain"] = abstain
+        if covariates:
+            # What this task is like, so a contested situation's conditional
+            # rule can be read for it (``amfs_core.actions.split_contested``).
+            body["covariates"] = {
+                str(k): v for k, v in covariates.items()
+                if isinstance(v, (bool, int, float, str))
+            }
         data = self._post("/api/v1/retrieve", body)
         self._capture_reuse_value()
         rows = data if isinstance(data, list) else data.get("entries", [])

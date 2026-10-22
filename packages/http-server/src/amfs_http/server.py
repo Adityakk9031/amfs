@@ -1193,6 +1193,7 @@ def _priors_for_retrieve(
     environment: Mapping[str, Any] | None = None,
     query_vector: list[float] | None = None,
     situation: str | None = None,
+    covariates: Mapping[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     """Action priors for ``entity_path`` on tasks like ``text``.
 
@@ -1261,33 +1262,53 @@ def _priors_for_retrieve(
     mine: list[dict[str, Any]] | None = None
     others: list[dict[str, Any]] = []
     elsewhere_rows: list[dict[str, Any]] = []
-    declared = _fold_situation(situation)
+    declared = _fold_situation(situation, covariates)
+    identity: dict[str, str] = {}
+    canonical = declared
     if declared and callable(stats):
-        # The situation's own record is an equality, not a neighbourhood.
-        # The embedding neighbourhood may hold none of it — a queue whose
-        # classes embed far apart returns no neighbour above the floor for a
-        # class seen once — and the fallback to the entity's whole record
-        # would then serve another class's winner as ``act``. Measured on
-        # the ops-queue support demo (2026-09-22): the first Android ticket
-        # was told ``act: explain_and_close`` from the webhook class's record
-        # and spent its three attempts on the entity's winners. So the exact
-        # rows come from the entity's record by situation, whatever the
-        # neighbourhood found; the neighbourhood supplies ``nearby``.
-        exact_rows = [r for r in rows if _fold_situation(r.get("situation")) == declared]
+        # The situation's own record is read by *identity*, not from the
+        # neighbourhood. The embedding neighbourhood may hold none of it — a
+        # queue whose classes embed far apart returns no neighbour above the
+        # floor for a class seen once — and the fallback to the entity's
+        # whole record would then serve another class's winner as ``act``.
+        # Measured on the ops-queue support demo (2026-09-22): the first
+        # Android ticket was told ``act: explain_and_close`` from the webhook
+        # class's record and spent its three attempts on the entity's
+        # winners. So the situation's rows come from the entity's record by
+        # label, whatever the neighbourhood found; the neighbourhood supplies
+        # ``nearby``.
+        #
+        # Identity, not equality: an agent spells one situation many ways
+        # (``csv export timeout`` / ``csv export timeout web`` / ``web data
+        # export timeout large date range`` — 14 spellings per class per
+        # cell on the 2026-10-21 regime study), and compared as folded
+        # strings the record was non-empty on 37 % of first searches after a
+        # change and the recommendation abstained on 70 %. The record's
+        # labels are joined under ``amfs_core.situations`` (token rule, first
+        # spelling canonical, a hosted resolver for synonyms) and the declared
+        # label is read against those canonicals: 93 % non-empty on the same
+        # searches.
+        scanned: list[dict[str, Any]] = []
+        try:
+            scanned = list(stats(entity_path, limit=SITUATION_RECORD_SCAN))
+        except Exception:  # noqa: BLE001
+            logger.debug("action_stats by situation failed", exc_info=True)
+        identity = _situation_identity(scanned, rows)
+        canonical = _resolve_situation(declared, identity)
+        exact_rows = [
+            r for r in rows if _canonical_situation(r, identity) == canonical
+        ]
         # The same scan gives the record *elsewhere* — the entity's other
         # situations — which is what orders a sweep over the untried
         # (``amfs_core.actions.sweep_order``).
-        try:
-            seen = {r.get("outcome_ref") for r in exact_rows}
-            for r in stats(entity_path, limit=SITUATION_RECORD_SCAN):
-                if _fold_situation(r.get("situation")) == declared:
-                    if r.get("outcome_ref") not in seen:
-                        exact_rows.append(r)
-                        seen.add(r.get("outcome_ref"))
-                else:
-                    elsewhere_rows.append(r)
-        except Exception:  # noqa: BLE001
-            logger.debug("action_stats by situation failed", exc_info=True)
+        seen = {r.get("outcome_ref") for r in exact_rows}
+        for r in scanned:
+            if _canonical_situation(r, identity) == canonical:
+                if r.get("outcome_ref") not in seen:
+                    exact_rows.append(r)
+                    seen.add(r.get("outcome_ref"))
+            else:
+                elsewhere_rows.append(r)
         # Partitioned when the situation has a record, or the neighbourhood
         # itself carries labels (so an empty record means "not seen yet",
         # not "older clients"). Labels found only elsewhere on the entity do
@@ -1301,12 +1322,12 @@ def _priors_for_retrieve(
         # pooled as for an undeclared situation. Only ever a question for a
         # situation with no match: a label that has matched is a class for
         # this caller, whatever other clients put in theirs.
-        if labelled and not exact_rows and not _labels_are_classes(elsewhere_rows):
+        if labelled and not exact_rows and not _labels_are_classes(elsewhere_rows, identity):
             labelled = False
         if labelled:
             mine = exact_rows
             others = (
-                [r for r in rows if _fold_situation(r.get("situation")) != declared]
+                [r for r in rows if _canonical_situation(r, identity) != canonical]
                 if source == "similar_outcomes" else []
             )
     if not rows and mine is None:
@@ -1316,8 +1337,16 @@ def _priors_for_retrieve(
             mine, candidate_actions=candidate_actions, environment=environment or None,
             situation_exact=True,
         )
-        block["situation_record"] = {"situation": str(situation)[:200], "outcomes": len(mine)}
-        block["nearby"] = _nearby_record(others, environment=environment or None)
+        record: dict[str, Any] = {"situation": str(situation)[:200], "outcomes": len(mine)}
+        spellings = sorted({_row_fold(r) for r in mine if r.get("situation")})
+        if len(spellings) > 1 or (spellings and spellings[0] != declared):
+            # What the record was read as: the spellings this label was
+            # joined with, so a reader can see the identity and a benchmark
+            # can measure its purity.
+            record["canonical"] = canonical[:200]
+            record["spellings"] = len(spellings)
+        block["situation_record"] = record
+        block["nearby"] = _nearby_record(others, environment=environment or None, identity=identity)
         if elsewhere_rows:
             elsewhere = aggregate_priors(elsewhere_rows, environment=environment or None)
             block["elsewhere"] = {
@@ -1357,51 +1386,91 @@ LABELS_MIN_ROWS = 20
 LABELS_MAX_DISTINCT_RATIO = 0.9
 
 
-def _labels_are_classes(rows: Sequence[Mapping[str, Any]]) -> bool:
+def _labels_are_classes(
+    rows: Sequence[Mapping[str, Any]], identity: Mapping[str, str] | None = None,
+) -> bool:
     """Whether the situations on *rows* recur — a class label — rather than
     naming each task once. Fewer than ``LABELS_MIN_ROWS`` labelled rows are
-    read as classes."""
-    labels = [_fold_situation(r.get("situation")) for r in rows if r.get("situation")]
+    read as classes. Counted over identities when *identity* is given: ten
+    spellings of one situation are one class, not ten."""
+    labels = [_canonical_situation(r, identity or {}) for r in rows if r.get("situation")]
     if len(labels) < LABELS_MIN_ROWS:
         return True
     return len(set(labels)) / len(labels) <= LABELS_MAX_DISTINCT_RATIO
 
 
-#: Words that carry no class information in a situation label: what the
-#: label is *of* ("ticket", "issue"), not what it is about. Dropped before
-#: labels are compared, so ``card declined ticket`` and ``card declined`` are
-#: one record.
-_SITUATION_NOISE = frozenset({
-    "a", "an", "the", "of", "on", "in", "for", "with", "and", "or", "to", "at", "by",
-    "ticket", "tickets", "issue", "issues", "problem", "problems", "case", "cases",
-    "request", "requests", "task", "tasks", "failure", "failures", "error", "errors",
-})
+#: The hosted second stage of situation identity, when one is installed
+#: (:func:`set_situation_resolver`): ``(folded label, canonicals) -> canonical
+#: or None``, asked only for a label the token rule joins to nothing. The
+#: open-source server runs the token rule alone.
+_situation_resolver: Any = None
 
 
-def _fold_situation(value: Any) -> str:
-    """A situation label as compared.
+def set_situation_resolver(resolver: Any) -> None:
+    """Install the second stage of situation identity — an alias table, an
+    embedder — consulted by the priors when the token rule finds no canonical
+    for a declared label. ``None`` removes it."""
+    global _situation_resolver
+    _situation_resolver = resolver if callable(resolver) else None
 
-    Case, whitespace and punctuation are folded (``Card-Declined`` is ``card
-    declined``), noise words that say what a label is of rather than what it
-    is about are dropped (``card declined ticket``), and the words are compared
-    as a set (``declined card``). Nothing is stemmed: ``ios`` and ``android``,
-    ``ui`` and ``backend`` must stay apart, and the classes a label is meant
-    to separate often differ by exactly one word. Measured on the CL support
-    harness (2026-09-26): a model asked to label the kind of ticket wrote the
-    same class as ``card declined``, ``Card-Declined`` and ``declined card
-    ticket`` across episodes; compared as typed, the class's record split
-    three ways and the one-loss turn never fired.
-    """
-    text = "".join(ch if ch.isalnum() else " " for ch in str(value or "").casefold())
-    words = [w for w in text.split() if w not in _SITUATION_NOISE]
-    if not words:
-        # A label made only of noise words is still a label: compare it as typed.
-        words = text.split()
-    return " ".join(sorted(set(words)))
+
+def _fold_situation(value: Any, covariates: Mapping[str, Any] | None = None) -> str:
+    """A situation label as stored and compared: ``amfs_core.situations.fold``.
+    Case, whitespace and punctuation folded, noise words dropped, the words
+    compared as a set, and the task's declared *covariates* — keys and
+    values — dropped from it (``android card declined plan team`` is ``card
+    declined``). Nothing is stemmed here — the fold is the record's key —
+    and spellings one stem or one word apart meet in
+    :func:`_situation_identity`."""
+    from amfs_core.situations import fold
+
+    return fold(value, covariates)
+
+
+def _row_fold(row: Mapping[str, Any]) -> str:
+    """A row's situation folded with the covariates the row recorded."""
+    from amfs_core.actions import recorded_covariates
+
+    return _fold_situation(row.get("situation"), recorded_covariates(row))
+
+
+def _situation_identity(
+    scanned: Sequence[Mapping[str, Any]], rows: Sequence[Mapping[str, Any]] = (),
+) -> dict[str, str]:
+    """The record's situation identity: every folded label on *scanned* (the
+    entity's record, newest first) and *rows* (the neighbourhood) joined to
+    its canonical — the first spelling of the situation, oldest first
+    (``amfs_core.situations.canonicalize``). The hosted resolver, when one is
+    installed, joins the synonyms the token rule cannot."""
+    from amfs_core.actions import _as_dt
+    from amfs_core.situations import canonicalize
+
+    def _when(r: Mapping[str, Any]) -> float:
+        at = _as_dt(r.get("committed_at"))
+        return at.timestamp() if at else 0.0
+
+    labels: list[str] = []
+    for r in sorted(list(scanned) + list(rows), key=_when):
+        labels.append(_row_fold(r))
+    return canonicalize(labels, resolver=_situation_resolver)
+
+
+def _resolve_situation(declared: str, identity: Mapping[str, str]) -> str:
+    """The canonical a declared (folded) label is read as under *identity*."""
+    from amfs_core.situations import resolve
+
+    return resolve(declared, identity, resolver=_situation_resolver)
+
+
+def _canonical_situation(row: Mapping[str, Any], identity: Mapping[str, str]) -> str:
+    """A row's situation as the record's identity reads it."""
+    folded = _row_fold(row)
+    return identity.get(folded, folded)
 
 
 def _nearby_record(
-    rows: list[dict[str, Any]], *, environment: Mapping[str, Any] | None = None
+    rows: list[dict[str, Any]], *, environment: Mapping[str, Any] | None = None,
+    identity: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     """The neighbourhood outside the declared situation, per situation:
     ``{"outcomes": n, "by_situation": [{"situation", "outcomes", "tried":
@@ -1411,7 +1480,7 @@ def _nearby_record(
 
     groups: dict[str, list[dict[str, Any]]] = {}
     for r in rows:
-        groups.setdefault(_fold_situation(r.get("situation")) or "(unlabelled)", []).append(r)
+        groups.setdefault(_canonical_situation(r, identity or {}) or "(unlabelled)", []).append(r)
 
     def _nearness(items: list[dict[str, Any]]) -> float:
         return max(float(r.get("task_similarity") or r.get("similarity") or 0.0) for r in items)
@@ -3817,6 +3886,7 @@ async def retrieve_entries(
             environment=environment,
             query_vector=priors_vec,
             situation=req.situation,
+            covariates=req.covariates or None,
         )
         top = head[0][0] if head else None
         top_bd = head[0][2] if head else {}
@@ -3949,6 +4019,9 @@ async def retrieve_entries(
             # a record that can name a winner but is not about this kind of
             # task, so a shift read over it does not send the agent exploring.
             priors_are_local=(priors or {}).get("source") != "action_stats",
+            # What this task is like, so a contested rule the situation's
+            # record split on is read for this task's side.
+            covariates=req.covariates or None,
         )
         if (
             priors is not None or recommendation is not None or shifted
