@@ -630,11 +630,19 @@ def split_contested(
             for threshold in values[1:]:
                 candidates.append((">=", threshold))
                 candidates.append(("<", threshold))
+        # A categorical key whose values hardly repeat is an identifier (a
+        # ticket number, an email, a client's own id), not a covariate: the
+        # values the losses carry would "explain" every loss with no
+        # exception. A covariate's values recur over the record, the takes
+        # before the contest included; three distinct values in four
+        # observations do not. (A numeric id that runs with time makes a
+        # clean turn, which the win-since requirement below already refuses.)
         fails = [
             v for v in values
             if sum(1 for x, ok in have if x == v and not ok) > sum(1 for x, ok in have if x == v and ok)
         ]
-        if fails and len(fails) < len(values):
+        identifier = len(values) * 4 >= (len(have) + len(earlier)) * 3
+        if fails and len(fails) < len(values) and not identifier:
             candidates.append(("in", fails))
         for op, arg in candidates:
             def on_side(v: Any, op: str = op, arg: Any = arg) -> bool:
@@ -774,34 +782,55 @@ def recorded_environment(row: Mapping[str, Any]) -> dict[str, str]:
 
 
 #: Session attributes that are not covariates: the run's environment (its
-#: own dimensions, weighted by :func:`_env_match`) and the situation label the
-#: record is partitioned by.
-_NOT_COVARIATES: frozenset[str] = frozenset({*ENVIRONMENT_KEYS, "situation"})
+#: own dimensions, weighted by :func:`_env_match`), the situation label the
+#: record is partitioned by, and the bookkeeping the SDK and server stamp on
+#: the bag — the served guidance's id and count, the branch, the canary
+#: assignment, the replay delivery, the verifier, the final action's index,
+#: the scope. None describes the task; a unique id would split any record
+#: perfectly and a counter would split it by time.
+_NOT_COVARIATES: frozenset[str] = frozenset({
+    *ENVIRONMENT_KEYS, "situation",
+    "guidance_id", "guidance_count", "memory_branch", "canary_fix_id", "canary_arm",
+    "replay_delivery_id", "verified_by", "final_action_index",
+    "entity_path", "agent_id", "session", "session_id", "trace_id", "outcome_ref",
+})
+
+
+def normalize_covariates(covariates: Mapping[str, Any] | None) -> dict[str, Any]:
+    """*covariates* as the record keeps them: keys stripped and lowercased,
+    scalar values only, the non-covariate keys (:data:`_NOT_COVARIATES`)
+    dropped. The one folding both the recorded rows and the asking task's
+    declaration go through, so ``Plan`` on a retrieve meets ``plan`` on a rule."""
+    out: dict[str, Any] = {}
+    if not isinstance(covariates, Mapping):
+        return out
+    for key, value in covariates.items():
+        k = str(key).strip().lower()
+        if not k or k in _NOT_COVARIATES or k in out:
+            continue
+        if isinstance(value, bool | int | float | str):
+            out[k] = value
+    return out
 
 
 def recorded_covariates(row: Mapping[str, Any]) -> dict[str, Any]:
     """The covariates an outcome row carries — the scalar attributes the run
-    declared about the *task* (``set_session_attributes`` / ``Run.begin(
-    covariates=...)``: the customer's plan, the app version the lookup showed,
-    the card's issuer country), as distinct from the run's own environment.
-    Read from a ``covariates`` block when the adapter returns one, else from
-    the session metadata's ``attributes`` bag less the environment keys and
-    the situation. Values are scalars; anything else is dropped."""
-    out: dict[str, Any] = {}
-    sources: list[Any] = [row.get("covariates")]
+    declared about the *task* (``Run.observe`` / ``Run.begin(covariates=
+    ...)``: the customer's plan, the app version the lookup showed, the card's
+    issuer country), as distinct from the run's own environment. Read from the
+    ``covariates`` block when the row has one — the declared channel, taken
+    whole — else from the session metadata's ``attributes`` bag (older SDKs
+    declare through ``set_session_attributes``) less the environment keys,
+    the situation and the SDK's bookkeeping. Values are scalars; anything
+    else is dropped."""
+    declared = normalize_covariates(row.get("covariates"))
+    if declared:
+        return declared
     meta = row.get("session_metadata")
-    if isinstance(meta, Mapping):
-        sources.append(meta.get("attributes"))
-    sources.append(row.get("attributes"))
-    for source in sources:
-        if not isinstance(source, Mapping):
-            continue
-        for key, value in source.items():
-            k = str(key).strip().lower()
-            if not k or k in _NOT_COVARIATES or k in out:
-                continue
-            if isinstance(value, bool | int | float | str):
-                out[k] = value
+    out: dict[str, Any] = {}
+    for source in ((meta.get("attributes") if isinstance(meta, Mapping) else None), row.get("attributes")):
+        for k, v in normalize_covariates(source).items():
+            out.setdefault(k, v)
     return out
 
 
@@ -1037,6 +1066,9 @@ def recommend(
     record_tried: list[Mapping[str, Any]] = list((priors or {}).get("tried") or [])
     untried: list[str] = list((priors or {}).get("untried") or [])
     have_candidates = bool(candidate_actions)
+    # The asking task's covariates, folded as the record's are (keys lowercased,
+    # bookkeeping dropped), so ``Plan`` on the retrieve meets ``plan`` on a rule.
+    covariates = normalize_covariates(covariates) or None
     # The mode is decided over the actions the caller can take. A winner
     # outside ``candidate_actions`` — a retry asking over what it has not
     # tried, after the winner just failed on this very task — cannot be acted
@@ -1850,6 +1882,25 @@ def plan_actions(
 
     if recommendation and recommendation.get("mode") in ("act", "explore"):
         _add(recommendation.get("suggested_action"))
+    elif recommendation and recommendation.get("mode") == "conditional":
+        # The record split on a covariate this task did not declare: the
+        # plan opens with the rule's two branches — what wins on the failing
+        # side first, since that is the side the record is contested on,
+        # then the contested action where it still works — never with the
+        # contested action's lifetime record, which is what the rule retires.
+        rule = recommendation.get("rule") if isinstance(recommendation.get("rule"), Mapping) else {}
+        opened = list(recommendation.get("untried") or [])
+        if rule.get("then"):
+            _add(rule.get("then"))
+            _add(rule.get("else"))
+        else:
+            # Nothing has won on the failing side yet: its untried come before
+            # the contested action, as the explore there would order them.
+            for a in opened[stable_bucket(agent_id, len(opened)):] + opened[:stable_bucket(agent_id, len(opened))]:
+                _add(a)
+            _add(rule.get("else"))
+        for a in opened:
+            _add(a)
     by_p = sorted(tried, key=lambda t: (-float(t.get("p", 0)), -int(t.get("n", 0))))
     losers = [
         t for t in by_p
