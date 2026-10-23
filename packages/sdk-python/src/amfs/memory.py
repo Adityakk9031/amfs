@@ -467,6 +467,10 @@ class AgentMemory:
         # Buffered separately from ``_session_metadata`` — which callers (and the
         # MCP server) reassign wholesale — and merged into it at commit time.
         self._session_attributes: dict[str, str | int | float | bool] = {}
+        # What this task is like, as declared (``declare_covariates`` /
+        # ``Run.observe``): carried on the outcome record as its own block,
+        # apart from the bag's bookkeeping, and cleared with the bag.
+        self._covariates: dict[str, str | int | float | bool] = {}
         self._session_llm_calls: list[dict[str, Any]] = []
 
         self._lifecycle: LifecycleManager | None = None
@@ -507,6 +511,8 @@ class AgentMemory:
         keys under the cap ahead of what a run set — the replay receiver's
         grader keys, say."""
         self._session_attributes = {}
+        self._covariates = {}
+        self._declare_situation()
 
     @property
     def session_llm_calls(self) -> list[dict[str, Any]]:
@@ -588,6 +594,7 @@ class AgentMemory:
         clone._session_metadata = None
         clone._session_attributes = {}
         clone._session_llm_calls = []
+        clone._declare_situation()
         return clone
 
     # ------------------------------------------------------------------
@@ -1042,6 +1049,7 @@ class AgentMemory:
         branch: str | None = None,
         environment: Mapping[str, Any] | None = None,
         abstain: bool = False,
+        covariates: Mapping[str, Any] | None = None,
     ) -> list[ScoredEntry]:
         """Rank memories by meaning for a natural-language query.
 
@@ -1058,9 +1066,12 @@ class AgentMemory:
         and how it went, plus a recommendation — ``act`` / ``explore`` /
         ``escalate`` — read afterwards from :attr:`last_priors`. Pass the
         actions you could take as ``candidate_actions`` (``tool:action`` keys)
-        so it can name the untried ones; ``situation`` labels the kind of task.
-        ``compact=True`` trims each hit to the fields an agent acts on. Both are
-        server-side features; the local adapters return entries without them.
+        so it can name the untried ones; ``situation`` labels the kind of task;
+        ``covariates`` says what this task is like (``{"plan": "pro"}``), so a
+        situation whose record has split on one of them is read for this
+        task rather than served as contested. ``compact=True`` trims each hit
+        to the fields an agent acts on. All are server-side features; the
+        local adapters return entries without them.
 
         *branch* defaults to the active branch (``checkout``), so an agent on
         a repair branch retrieves what that branch says, not what ``main`` does.
@@ -1094,6 +1105,8 @@ class AgentMemory:
                     extra["environment"] = env
                 if abstain:
                     extra["abstain"] = True
+                if covariates:
+                    extra["covariates"] = dict(covariates)
                 # Sent only off the default: every adapter's retrieve defaults
                 # to main, and an older one without the keyword would otherwise
                 # raise TypeError here and fall back to local scoring for every
@@ -1122,7 +1135,7 @@ class AgentMemory:
                         "adaptive_k": cfg.adaptive_k,
                         **extra,
                     },
-                    optional=("environment", "abstain", "branch", "situation",
+                    optional=("covariates", "environment", "abstain", "branch", "situation",
                               "compact", "candidate_actions", "include_priors"),
                 )
                 scored = [
@@ -1552,6 +1565,7 @@ class AgentMemory:
         actions_taken: list[dict[str, Any]] | None = None,
         verified_by: str | None = None,
         evidence: Mapping[str, Any] | None = None,
+        covariates: Mapping[str, Any] | None = None,
     ) -> list[MemoryEntry]:
         """Record an outcome and back-propagate confidence changes.
 
@@ -1559,14 +1573,24 @@ class AgentMemory:
         keys alone do not (an episode that read nothing still happened
         somewhere); with the causal keys' paths it becomes the record's
         ``entity_paths``, which is how later retrieves on that entity find it.
-        *situation* is an optional label for the kind of task. *actions_taken*
-        is derived from the recorded actions, the attempts and the final action
-        index unless given explicitly — see ``amfs_core.actions.actions_taken``.
+        *situation* is an optional label for the kind of task. It goes on the
+        outcome record, where action priors and lessons read it, and on the
+        sealed trace as the ``situation`` attribute — the same stamp
+        ``Run.begin(situation=...)`` makes — because that is where the repair
+        loop's weak-situation scan reads it. Until it travelled on the trace
+        an agent that labelled every commit through ``amfs_commit_outcome``
+        or this method directly had no situations on the server at all, and
+        the scheduled proposer had nothing to read. *actions_taken* is derived
+        from the recorded actions, the attempts and the final action index
+        unless given explicitly — see ``amfs_core.actions.actions_taken``.
 
         *verified_by* says where the outcome came from when the agent did not
         decide it itself — ``"ci"``, ``"human"``, ``"verifier"``, ``"customer"``.
         An outcome with it is external evidence; one without is the agent's own
-        declaration, and the repair loop's canary treats the two differently.
+        declaration. The two are weighed differently everywhere: a verified
+        outcome moves the evidence behind the entries it cites by
+        ``amfs_core.evidence.VERIFIED_EVIDENCE_WEIGHT`` (1.5x) over the agent's
+        word, and the repair loop's canary treats the two differently.
         *evidence* is a small bag of pointers to that source (``{"run_id": ...,
         "url": ...}``). Both travel as session attributes — ``verified_by`` and
         ``evidence_<key>`` — so they reach the sealed trace on every path.
@@ -1618,10 +1642,16 @@ class AgentMemory:
         untrue one of the two. The trace is still built and still left on
         ``_last_trace``; only the write is skipped.
         """
-        # Validated first so a bad bag fails before anything is written.
-        commit_attributes = validate_session_attributes(
-            {**(attributes or {}), **provenance_attributes(verified_by, evidence)}
-        )
+        # Validated first so a bad bag fails before anything is written. The
+        # situation named on this commit is this run's label: it goes over a
+        # ``Run.begin`` stamp (the later, more specific statement) and over the
+        # same key in *attributes*, which is the same thing said twice.
+        commit_attributes = validate_session_attributes({
+            **(attributes or {}),
+            **({SITUATION_ATTRIBUTE: " ".join(str(situation).split())[:200]}
+               if situation and str(situation).strip() else {}),
+            **provenance_attributes(verified_by, evidence),
+        })
         explicit_calls = [
             c for c in (_normalize_llm_call(lc) for lc in (llm_calls or [])) if c is not None
         ]
@@ -1734,6 +1764,10 @@ class AgentMemory:
             actions_taken=actions_taken,
             entity_paths=entity_paths,
             situation=situation,
+            # The task's covariates as declared, their own block on the record:
+            # the server splits a contested situation on them and must not
+            # mistake the bag's bookkeeping for one.
+            covariates=dict(covariates) if covariates is not None else dict(self._covariates),
         )
         updated = self._propagator.propagate(record)
         self._write_contrast_lesson(record)
@@ -1897,7 +1931,9 @@ class AgentMemory:
         # process start rather than describing the work it covers.
         self._read_tracker.clear()
         self._session_attributes = {}
+        self._covariates = {}
         self._session_llm_calls = []
+        self._declare_situation()
         return updated
 
     def record_attempt(
@@ -2108,6 +2144,11 @@ class AgentMemory:
         string values up to 256 characters; anything else raises. Keys are
         lowercased. The bag is cleared when the trace is committed.
 
+        ``situation`` is also declared to the server on every request from
+        then on (``X-AMFS-Situation``, through an adapter that talks to one):
+        a canary on a fix for that situation routes only the sessions that
+        declare it, so declare it before the first read — ``Run.begin`` does.
+
         The key cap applies to the bag as merged, not to each call: a merge that
         would take it past 20 keys raises ``ValueError`` and leaves the bag as
         it was.
@@ -2120,7 +2161,64 @@ class AgentMemory:
         merged = {**self._session_attributes, **validated}
         _check_attribute_count(merged, "the session attribute bag")
         self._session_attributes = merged
+        if SITUATION_ATTRIBUTE in validated:
+            self._declare_situation()
         return dict(self._session_attributes)
+
+    def declare_covariates(self, covariates: Mapping[str, Any]) -> dict[str, Any]:
+        """Declare what this task is like — the customer's plan, the app
+        version a lookup showed, the card's issuer — as covariates on the
+        outcome and on the record's view of it. Scalars only; keys folded to
+        lower case; the run's environment keys and ``situation`` are not
+        covariates and raise. They also go on the session attribute bag, so a
+        server that reads only the bag still sees them. Returns the covariates
+        as they now stand. ``Run.observe`` is the usual way in."""
+        clean: dict[str, str | int | float | bool] = {}
+        for key, value in dict(covariates).items():
+            k = str(key).strip().lower()
+            if not k:
+                continue
+            if k in ENVIRONMENT_KEYS or k == SITUATION_ATTRIBUTE:
+                raise ValueError(f"{k!r} is the run's environment, not a covariate")
+            if not isinstance(value, (bool, int, float, str)):
+                raise TypeError(f"covariate {k!r} must be a scalar, got {type(value).__name__}")
+            clean[k] = value
+        if clean:
+            self.set_session_attributes(clean)
+            self._covariates.update(clean)
+        return dict(self._covariates)
+
+    @property
+    def covariates(self) -> dict[str, Any]:
+        """The covariates declared so far this session."""
+        return dict(self._covariates)
+
+    def clear_covariates(self) -> None:
+        """Drop the covariates declared so far — from the block and from the
+        bag — without touching the rest of the bag. ``Run.begin`` calls it:
+        a run that observed and never committed must not tag the next run's
+        outcome with the previous task's plan, which would put it on the
+        wrong side of a contested split. The commit clears them itself."""
+        for key in self._covariates:
+            self._session_attributes.pop(key, None)
+        self._covariates = {}
+
+    def _declare_situation(self) -> None:
+        """Tell the adapter the situation the bag now carries, when it can
+        listen (``HttpAdapter.declare_situation``; the local adapters have no
+        request to put it on). A server running a canary on a fix for one
+        situation routes a session into an arm only while it declares that
+        situation, so the header follows the bag: set with the attribute —
+        ``Run.begin(situation=...)`` sets it before the first read — and
+        dropped when the bag is cleared at commit. Never raises."""
+        declare = getattr(self._adapter, "declare_situation", None)
+        if not callable(declare):
+            return
+        value = self._session_attributes.get(SITUATION_ATTRIBUTE)
+        try:
+            declare(str(value) if isinstance(value, str) and value.strip() else None)
+        except Exception:  # noqa: BLE001 - routing is the server's concern, not the run's
+            logger.debug("adapter.declare_situation failed", exc_info=True)
 
     def environment(self) -> dict[str, str]:
         """The run's environment as the session knows it: ``model``,

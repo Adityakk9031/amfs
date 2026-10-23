@@ -81,6 +81,11 @@ class OutcomeRequest(BaseModel):
     entity_path: str | None = None
     #: Optional label for the kind of task ("card-declined ticket").
     situation: str | None = None
+    #: What this task was like, as the run declared it (``{"plan": "pro"}``):
+    #: scalars keyed by name. Stored on the outcome row as its own block;
+    #: a contested situation is split on these, never on the attribute bag's
+    #: bookkeeping.
+    covariates: dict[str, Any] | None = None
 
 
 class SearchRequest(BaseModel):
@@ -135,6 +140,13 @@ class RetrieveRequest(BaseModel):
 
     query: str
     entity_path: str | None = None
+    # Widens entity_path to that path and everything beneath it, on both the
+    # semantic and the lexical channel (see SearchRequest.include_descendants
+    # and amfs_core.scope). Off by default so an exact-match caller keeps
+    # getting exactly what it asked for. For a caller whose scope is a prefix
+    # rather than an entity — a served model trained on `research/*` with no
+    # path on the request — an exact match on the prefix finds nothing.
+    include_descendants: bool = False
     min_confidence: float = 0.0
     limit: int = 10
     semantic_weight: float = 0.5
@@ -178,6 +190,11 @@ class RetrieveRequest(BaseModel):
     #: What kind of task this is, embedded for the priors' nearest-neighbour
     #: lookup in place of the query when given.
     situation: str | None = None
+    #: What this task is like, as scalars (``{"plan": "pro"}``). When the
+    #: situation's record has split on one of them — the old action still
+    #: wins on one side and lost on the other — the recommendation is read
+    #: for this task's side instead of served as contested.
+    covariates: dict[str, Any] | None = None
     #: Return the fields an agent acts on and drop the bookkeeping (score
     #: breakdown, importance dimensions, integrity fields, long values trimmed).
     #: Roughly a third of the tokens of the full payload.

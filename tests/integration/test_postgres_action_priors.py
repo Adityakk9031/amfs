@@ -187,6 +187,36 @@ def test_outcome_rows_carry_the_environment_they_were_recorded_in(adapter) -> No
     assert plain["won"] == scoped["won"] == 2 and scoped["p"] < plain["p"]
 
 
+def test_outcome_rows_carry_the_covariates_the_run_declared_not_the_bags_bookkeeping(adapter) -> None:
+    """Migration 014: the record's own ``covariates`` block lands in the
+    column and comes back on both priors reads. A record with no declared
+    block falls back to the bag less the SDK's bookkeeping, so a server fed
+    by an older SDK still splits on what the run set — and never on the
+    guidance id it stamped."""
+    assert adapter._has_covariates_col
+    loss = {"index": 0, "action_key": "resolve:resend", "tool_name": "resolve", "success": False, "attempt": None}
+    declared = _record(OutcomeType.FAILURE, [], actions=[loss], paths=["acme/support"], situation="export timeout")
+    declared = declared.model_copy(update={
+        "covariates": {"plan": "pro", "app_major": 9},
+        "session_metadata": {"attributes": {"plan": "pro", "guidance_id": "g-1", "guidance_count": 2,
+                                            "situation": "export timeout"}},
+    })
+    adapter.commit_outcome(declared)
+    bag_only = _record(OutcomeType.FAILURE, [], agent="a2", actions=[loss], paths=["acme/support"],
+                       situation="export timeout")
+    bag_only = bag_only.model_copy(update={"session_metadata": {
+        "attributes": {"plan": "team", "guidance_id": "g-2", "verified_by": "ci", "situation": "export timeout"},
+    }})
+    adapter.commit_outcome(bag_only)
+
+    stats = adapter.action_stats("acme/support")
+    by_agent = {r["agent_id"]: r["covariates"] for r in stats}
+    assert by_agent["a1"] == {"plan": "pro", "app_major": 9}
+    assert by_agent["a2"] == {"plan": "team"}
+    similar = adapter.similar_outcomes("acme/support", _Embedder().embed("export timeout"), k=10, min_similarity=0.9)
+    assert {r["agent_id"]: r["covariates"] for r in similar} == by_agent
+
+
 def test_migration_is_idempotent_on_a_bootstrapped_database(adapter) -> None:
     """Re-applying 008+009 (a restart) changes nothing and keeps one step overload."""
     adapter._apply_schema_if_needed() if hasattr(adapter, "_apply_schema_if_needed") else None
