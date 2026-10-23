@@ -68,7 +68,7 @@ jobs:
         run: |
           uv venv .venv
           source .venv/bin/activate
-          uv pip install -e packages/core -e packages/adapters/filesystem -e packages/adapters/postgres -e packages/sdk-python -e packages/cli -e packages/mcp-server -e packages/cortex -e packages/http-server
+          uv pip install -e packages/core -e packages/adapters/filesystem -e packages/adapters/postgres -e packages/adapters/s3 -e packages/sdk-python -e packages/cli -e packages/mcp-server -e packages/cortex -e packages/http-server
           uv pip install pytest pytest-asyncio pyyaml
           # The webhook route answers 501 without amfs_connectors, so the tests
           # that post through it need the package installed.
@@ -82,14 +82,20 @@ jobs:
       - name: Run integration tests (filesystem)
         run: |
           source .venv/bin/activate
-          pytest tests/integration/test_filesystem_adapter.py -v
+          pytest tests/integration/test_filesystem_adapter.py tests/integration/test_openrouter_proxy.py -v
 
       - name: Run integration tests (postgres)
         env:
           AMFS_TEST_PG_DSN: postgresql://postgres:test@localhost:5432/amfs_test
         run: |
           source .venv/bin/activate
-          pytest tests/integration/test_postgres_adapter.py -v
+          # The evidence suites run here too: the outcome arithmetic lives in
+          # PL/pgSQL rendered from amfs_core.evidence (migration 012), and the
+          # parity test is what says the two still agree on random outcome
+          # sequences. Without a database it skips, which is not a pass.
+          pytest tests/integration/test_postgres_adapter.py \
+                 tests/integration/test_postgres_outcome_evidence.py \
+                 tests/integration/test_postgres_evidence_parity.py -v
 
   # The hosted product builds these packages from this git tree, so a change here
   # reaches production whether or not it is ever published. Everything else reads

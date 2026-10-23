@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Mapping
 from datetime import datetime, timezone
 from typing import Any
 
@@ -141,9 +142,11 @@ class OutcomeBackPropagator:
         actions_taken: list[dict[str, Any]] | None = None,
         entity_paths: list[str] | None = None,
         situation: str | None = None,
+        covariates: Mapping[str, Any] | None = None,
     ) -> OutcomeRecord:
         """Convenience factory for creating OutcomeRecord instances."""
         return OutcomeRecord(
+            covariates=dict(covariates or {}),
             attempts=attempts or [],
             final_action_index=final_action_index,
             causal_entry_versions=dict(causal_entry_versions or {}),
