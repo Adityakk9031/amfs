@@ -469,7 +469,7 @@ provides-extras = ["langgraph"]
 
 [[package]]
 name = "amfs-mcp-server"
-version = "0.7.47"
+version = "0.7.48"
 source = { editable = "packages/mcp-server" }
 dependencies = [
     { name = "amfs" },
